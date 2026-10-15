@@ -218,3 +218,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------- project specific
+# 原始日志（含 sk_ / acc_ / wrk_ 等敏感标识）
+logs/
+
+# SQLite 数据库生成物
+usage.db
+usage.db-wal
+usage.db-shm
+
+# 临时脚本与扫描产物
+tmp/
