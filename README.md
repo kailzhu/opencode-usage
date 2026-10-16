@@ -14,6 +14,7 @@ opencode-usage/
 ├─ schema.sql                  tables + indexes, executed by db_import.py
 ├─ db_import.py                importer: idempotent load, dedup, ledger, conflict log
 ├─ db_query.py                 query tool: sources / models / accounts subcommands
+├─ shared/                     shared modules: table rendering and formatters
 ├─ usage.db                    SQLite database (generated; gitignored)
 ├─ README.md                   English docs (this file)
 └─ README.zh-CN.md             Chinese docs

@@ -13,6 +13,7 @@ opencode-usage/
 ├─ schema.sql                  建表 + 索引，由 db_import.py 自动执行
 ├─ db_import.py                导入器：幂等导入、去重、台账、冲突登记
 ├─ db_query.py                 查询工具：sources / models / accounts 子命令
+├─ shared/                     共享模块：表格渲染与格式化
 ├─ usage.db                    SQLite 数据库（生成物；已 gitignore）
 ├─ README.md                   英文文档
 └─ README.zh-CN.md             中文文档（本文件）

@@ -19,11 +19,12 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-DEFAULT_DB = HERE / "usage.db"
+from shared.fmt import (fmt_count_pct, fmt_int, fmt_iso, fmt_ms,
+                        fmt_span, parse_tz, tz_label, trunc_id)
+from shared.paths import DB_PATH
+from shared.table import render
 
 SOURCES_HEADERS = ["file name", "records", "added", "dup", "conflict", "trunc",
                    "data from", "data to", "span", "imported at"]
@@ -41,111 +42,6 @@ ACCOUNTS_HEADERS = ["workspace", "account", "api key", "total cost (usd)", "requ
 ACCOUNTS_ALIGNS = ["l", "l", "l"] + ["r"] * 7
 ACCOUNTS_GROUPS = [None, None, None, None, None,
                    "tokens", "tokens", "tokens", "tokens", "tokens"]
-
-
-def parse_tz(value: str):
-    """把 --tz 值解析成 tzinfo；返回 None 表示用本机时区。
-
-    接受 'local'（本机）、'UTC'，或小时偏移如 '8'、'+8'、'-5'。
-    """
-    v = value.strip().lower()
-    if v in ("", "local"):
-        return None
-    if v in ("utc", "gmt", "z"):
-        return timezone.utc
-    return timezone(timedelta(hours=float(v.lstrip("+"))))
-
-
-def tz_label(tz) -> str:
-    """时区标签，形如 'UTC+08'、'UTC-05'、'UTC+05:30'；本机时区追加 ' local'。"""
-    t = tz if tz is not None else datetime.now().astimezone().tzinfo
-    offset = datetime.now(t).utcoffset() or timedelta(0)
-    total = int(offset.total_seconds())
-    sign = "+" if total >= 0 else "-"
-    hh, mm = divmod(abs(total) // 60, 60)
-    label = f"UTC{sign}{hh:02d}" + (f":{mm:02d}" if mm else "")
-    return f"{label} local" if tz is None else label
-
-
-def fmt_ms(ms, tz) -> str:
-    if ms is None:
-        return "n/a"
-    dt = datetime.fromtimestamp(ms / 1000, tz) if tz else datetime.fromtimestamp(ms / 1000)
-    return dt.strftime("%Y-%m-%d %H:%M")
-
-
-def fmt_span(a, b) -> str:
-    if a is None or b is None:
-        return "n/a"
-    hours = (b - a) / 3_600_000
-    return f"{hours / 24:.1f}d" if hours >= 48 else f"{hours:.1f}h"
-
-
-def fmt_iso(s, tz) -> str:
-    """把导入台账里的 ISO-8601 UTC 时间按 tz 显示（tz 为 None 时用本机时区）。"""
-    if not s:
-        return "n/a"
-    try:
-        dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return str(s)
-    dt = dt.astimezone(tz) if tz else dt.astimezone()
-    return dt.strftime("%Y-%m-%d %H:%M")
-
-
-def render(headers, aligns, rows, separator_before=None, groups=None) -> None:
-    # 单元格可以是普通值，也可以是 (文本, 对齐) 二元组以覆盖该列的默认对齐
-    def text_of(v):
-        return v[0] if isinstance(v, tuple) else v
-
-    def align_of(v, default):
-        return v[1] if isinstance(v, tuple) and len(v) > 1 else default
-
-    widths = []
-    for i, h in enumerate(headers):
-        cells = [len(str(text_of(r[i]))) for r in rows] or [0]
-        widths.append(max(len(str(h)), *cells))
-
-    def rule() -> str:
-        return "+" + "+".join("-" * (w + 2) for w in widths) + "+"
-
-    def row_line(vals) -> str:
-        cells = []
-        for i, v in enumerate(vals):
-            s = str(text_of(v))
-            a = align_of(v, aligns[i])
-            if a == "r":
-                s = s.rjust(widths[i])
-            elif a == "c":
-                s = s.center(widths[i])
-            else:
-                s = s.ljust(widths[i])
-            cells.append(s)
-        return "| " + " | ".join(cells) + " |"
-
-    def group_line() -> str:
-        """分组表头：组名横跨其覆盖的几列（组内不画竖线）。"""
-        out, i = [], 0
-        while i < len(headers):
-            g = groups[i]
-            j = i
-            while j + 1 < len(headers) and groups[j + 1] == g:
-                j += 1
-            area = sum(widths[i:j + 1]) + 2 + 3 * (j - i)
-            out.append("|" + ("" if g is None else str(g)).center(area))
-            i = j + 1
-        return "".join(out) + "|"
-
-    print(rule())
-    if groups:
-        print(group_line())
-    print(row_line(headers))
-    print(rule())
-    for i, r in enumerate(rows):
-        if separator_before is not None and i == separator_before:
-            print(rule())
-        print(row_line(r))
-    print(rule())
 
 
 def cmd_sources(conn: sqlite3.Connection, tz) -> int:
@@ -196,18 +92,6 @@ def cmd_sources(conn: sqlite3.Connection, tz) -> int:
     return 0
 
 
-def fmt_pct(num: int, den: int) -> str:
-    return f"{100.0 * num / den:.2f}%" if den else "n/a"
-
-
-def fmt_int(v: int) -> str:
-    return f"{v:,}"
-
-
-def fmt_count_pct(num: int, den: int) -> str:
-    return f"{num} ({fmt_pct(num, den)})"
-
-
 def cmd_models(conn: sqlite3.Connection) -> int:
     rows = conn.execute(
         "SELECT model,"
@@ -254,15 +138,6 @@ def cmd_models(conn: sqlite3.Connection) -> int:
           "  requests  = 请求计数：total = 请求总数（去重后）；cancelled = 取消数；\n"
           "              failed = 失败数（failed + rejected）；括号内为占请求总数的比例")
     return 0
-
-
-def trunc_id(s, width: int = 20) -> str:
-    """ID 截断显示：保留前缀与尾部，中间用 … 代替（默认总宽 20 字符）。"""
-    if not s:
-        return "—"
-    if len(s) <= width:
-        return s
-    return s[: width - 6] + "…" + s[-5:]
 
 
 def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
@@ -342,8 +217,8 @@ def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
 def common_args(with_tz: bool = True) -> argparse.ArgumentParser:
     """子命令共享的选项：--db（所有子命令）与 --tz（仅显示时间的子命令）。"""
     c = argparse.ArgumentParser(add_help=False)
-    c.add_argument("--db", default=str(DEFAULT_DB), metavar="PATH",
-                   help=f"SQLite 数据库路径（默认: {DEFAULT_DB.name}）")
+    c.add_argument("--db", default=str(DB_PATH), metavar="PATH",
+                   help=f"SQLite 数据库路径（默认: {DB_PATH.name}）")
     if with_tz:
         c.add_argument("--tz", default="local", metavar="TZ",
                        help="显示时区：local（默认，本机时区）、UTC，或小时偏移如 8、+8、-5")
