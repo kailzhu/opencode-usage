@@ -24,10 +24,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-DEFAULT_DB = HERE / "usage.db"
-DEFAULT_LOGS = HERE / "logs"
-DEFAULT_SCHEMA = HERE / "schema.sql"
+from shared.fmt import fmt_int
+from shared.paths import DB_PATH, LOGS_DIR, ROOT, SCHEMA_PATH
+from shared.table import render
+
+IMPORT_HEADERS = ["file name", "records", "added", "dup", "conflict"]
+IMPORT_ALIGNS = ["l", "r", "r", "r", "r"]
 
 # 列顺序必须与 schema.sql 中的 requests 表一致。
 REQUEST_COLUMNS = [
@@ -172,7 +174,7 @@ def source_label(path: Path) -> str:
 def display_path(path: Path) -> str:
     """台账里的路径：尽量相对项目目录，便于阅读且跨机器稳定。"""
     try:
-        return path.resolve().relative_to(HERE).as_posix()
+        return path.resolve().relative_to(ROOT).as_posix()
     except ValueError:
         return path.resolve().as_posix()
 
@@ -182,11 +184,12 @@ def import_file(conn, path: Path, *, dry_run: bool) -> dict:
     sha = hashlib.sha256(data).hexdigest()
     name = path.name
 
-    known = conn.execute(
+    # 已导入过（sha256 命中台账）：逐条与库内比对以得出 dup / conflict，
+    # 但不写入任何东西 —— 不插记录、不写 conflicts、不重写台账（保留首次 imported_at）。
+    stats_only = conn.execute(
         "SELECT 1 FROM imports WHERE sha256 = ?", (sha,)
-    ).fetchone()
-    if known and not dry_run:
-        return {"status": "skipped", "name": name, "records": len(records)}
+    ).fetchone() is not None
+    writes = not dry_run and not stats_only
 
     hashes = dict(conn.execute("SELECT request_id, record_hash FROM requests"))
     req_sql = (f"INSERT INTO requests ({','.join(REQUEST_COLUMNS)}) "
@@ -211,23 +214,25 @@ def import_file(conn, path: Path, *, dry_run: bool) -> dict:
         rhash = record_hash(rec)
         prev = hashes.get(rid)
         if prev is None:
-            row = build_row(rec, rhash, source_label(path))
-            conn.execute(req_sql, tuple(row[c] for c in REQUEST_COLUMNS))
-            conn.executemany(att_sql, build_attempt_rows(rid, rec))
-            hashes[rid] = rhash
             inserted += 1
+            if writes:
+                row = build_row(rec, rhash, source_label(path))
+                conn.execute(req_sql, tuple(row[c] for c in REQUEST_COLUMNS))
+                conn.executemany(att_sql, build_attempt_rows(rid, rec))
+            hashes[rid] = rhash
         elif prev == rhash:
             duplicates += 1
         else:
             conflicts += 1
-            conn.execute(
-                "INSERT OR IGNORE INTO conflicts"
-                "(request_id, first_hash, other_hash, first_source, other_source, detected_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (rid, prev, rhash, None, name, now_utc()),
-            )
+            if writes:
+                conn.execute(
+                    "INSERT OR IGNORE INTO conflicts"
+                    "(request_id, first_hash, other_hash, first_source, other_source, detected_at)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (rid, prev, rhash, None, name, now_utc()),
+                )
 
-    if not dry_run:
+    if writes:
         conn.execute(
             "INSERT OR REPLACE INTO imports"
             "(sha256, name, path, bytes, imported_at, records, inserted, duplicates,"
@@ -236,9 +241,9 @@ def import_file(conn, path: Path, *, dry_run: bool) -> dict:
             (sha, name, display_path(path), len(data), now_utc(), len(records),
              inserted, duplicates, conflicts, truncated, until, first_start, last_finish),
         )
-    return {"status": "imported", "name": name, "records": len(records),
-            "inserted": inserted, "duplicates": duplicates, "conflicts": conflicts,
-            "truncated": truncated}
+    return {"status": "skipped" if stats_only else "imported", "name": name,
+            "records": len(records), "inserted": inserted, "duplicates": duplicates,
+            "conflicts": conflicts, "truncated": truncated}
 
 
 def resolve_files(args) -> list[Path]:
@@ -276,12 +281,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--file", action="append", nargs="+", metavar="PATH",
                    help="要导入的 JSON 文件；可给多个，亦可重复使用本选项。省略则导入 --logs 目录下全部 *.json")
-    p.add_argument("--db", default=str(DEFAULT_DB), metavar="PATH",
-                   help=f"SQLite 数据库路径（默认: {DEFAULT_DB.name}）")
-    p.add_argument("--logs", default=str(DEFAULT_LOGS), metavar="DIR",
-                   help=f"未指定 --file 时扫描的目录（默认: {DEFAULT_LOGS.name}/）")
-    p.add_argument("--schema", default=str(DEFAULT_SCHEMA), metavar="PATH",
-                   help=f"建表脚本路径（默认: {DEFAULT_SCHEMA.name}）")
+    p.add_argument("--db", default=str(DB_PATH), metavar="PATH",
+                   help=f"SQLite 数据库路径（默认: {DB_PATH.name}）")
+    p.add_argument("--logs", default=str(LOGS_DIR), metavar="DIR",
+                   help=f"未指定 --file 时扫描的目录（默认: {LOGS_DIR.name}/）")
+    p.add_argument("--schema", default=str(SCHEMA_PATH), metavar="PATH",
+                   help=f"建表脚本路径（默认: {SCHEMA_PATH.name}）")
     p.add_argument("--dry-run", action="store_true",
                    help="只解析并统计，不写入数据库")
     return p
@@ -311,33 +316,34 @@ def main(argv=None) -> int:
     print(f"database : {db_path}")
     print(f"files    : {len(files)}" + ("   [dry-run]" if args.dry_run else ""))
     print()
-    print(f"{'file':44s} {'records':>8s} {'added':>9s} {'dup':>7s} {'conflict':>9s}")
-    print("-" * 82)
 
+    table = []
     tot = {"records": 0, "inserted": 0, "duplicates": 0, "conflicts": 0}
-    skipped = 0
     for path in files:
         try:
             res = import_file(conn, path, dry_run=args.dry_run)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            print(f"{path.name:44s}  ERROR: {exc}", file=sys.stderr)
-            continue
-        if res["status"] == "skipped":
-            skipped += 1
-            print(f"{res['name']:44s} {'-':>8s} {'skipped (already imported)':>28s}")
+            print(f"error: {path.name}: {exc}", file=sys.stderr)
             continue
         for k in tot:
             tot[k] += res[k]
-        print(f"{res['name']:44s} {res['records']:8d} {res['inserted']:9d} "
-              f"{res['duplicates']:7d} {res['conflicts']:9d}")
+        label = f"{res['name']} (skipped)" if res["status"] == "skipped" else res["name"]
+        table.append([
+            label, fmt_int(res["records"]), fmt_int(res["inserted"]),
+            fmt_int(res["duplicates"]), fmt_int(res["conflicts"]),
+        ])
         if not args.dry_run:
             conn.commit()
 
-    print("-" * 82)
-    print(f"{'TOTAL':44s} {tot['records']:8d} {tot['inserted']:9d} "
-          f"{tot['duplicates']:7d} {tot['conflicts']:9d}")
-    if skipped:
-        print(f"({skipped} 个文件已导入过，已跳过)")
+    table.append([
+        "TOTAL", fmt_int(tot["records"]), fmt_int(tot["inserted"]),
+        fmt_int(tot["duplicates"]), fmt_int(tot["conflicts"]),
+    ])
+    render(IMPORT_HEADERS, IMPORT_ALIGNS, table,
+           separator_before=len(table) - 1 if len(table) > 1 else None)
+
+    total_records = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+    print(f"\nTotal records in database: {fmt_int(total_records)}")
 
     if args.dry_run:
         conn.rollback()
