@@ -4,7 +4,8 @@
 子命令：
   sources   列出最近导入的文件：文件名、记录数、去重统计、是否被截断、
             数据覆盖时间范围，以及导入本数据库的时间。
-  models    列出总花费最高的 model：总花费、各类 token 消耗、取消率与失败率。
+  models    列出总花费最高的 model（按 provider/product 拆分）：总花费、各类 token 消耗、
+            取消率与失败率。
   accounts  按 workspace / 账户 / API Key 三层列出花费、请求数与各类 token 消耗。
 
 Example:
@@ -36,10 +37,10 @@ SOURCES_HEADERS = ["file name", "records", "added", "dup", "conflict", "trunc",
                    "data from", "data to", "span", "imported at"]
 SOURCES_ALIGNS = ["l", "r", "r", "r", "r", "c", "l", "l", "r", "l"]
 
-MODELS_HEADERS = ["model", "total cost (usd)", "input", "output", "reasoning",
-                  "cache read", "cache write", "total", "cancelled", "failed"]
-MODELS_ALIGNS = ["l"] + ["r"] * 9
-MODELS_GROUPS = [None, None,
+MODELS_HEADERS = ["model", "provider", "total cost (usd)", "input", "output",
+                  "reasoning", "cache read", "cache write", "total", "cancelled", "failed"]
+MODELS_ALIGNS = ["r", "l"] + ["r"] * 9
+MODELS_GROUPS = [None, None, None,
                  "tokens", "tokens", "tokens", "tokens", "tokens",
                  "requests", "requests", "requests"]
 
@@ -103,51 +104,77 @@ def cmd_sources(conn: sqlite3.Connection, tz, show_all: bool = False) -> int:
 
 
 def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
-    rows = conn.execute(
-        "SELECT model,"
-        "       SUM(COALESCE(cost_usd, 0))             AS total_cost,"
-        "       SUM(COALESCE(input_tokens, 0))         AS input_tokens,"
-        "       SUM(COALESCE(output_tokens, 0))        AS output_tokens,"
-        "       SUM(COALESCE(reasoning_tokens, 0))     AS reasoning_tokens,"
-        "       SUM(COALESCE(cache_read_tokens, 0))    AS cache_read_tokens,"
-        "       SUM(COALESCE(cache_write_tokens, 0))   AS cache_write_tokens,"
-        "       COUNT(*)                               AS requests,"
-        "       SUM(outcome = 'cancelled')             AS cancelled,"
-        "       SUM(outcome IN ('failed', 'rejected')) AS failures"
-        "  FROM requests GROUP BY model"
-        " ORDER BY total_cost DESC, requests DESC, model"
-    ).fetchall()
+    rows = conn.execute("""
+        SELECT model,
+               COALESCE(provider, '(none)'),
+               COALESCE(product, ''),
+               SUM(COALESCE(cost_usd, 0)),
+               SUM(COALESCE(input_tokens, 0)),
+               SUM(COALESCE(output_tokens, 0)),
+               SUM(COALESCE(reasoning_tokens, 0)),
+               SUM(COALESCE(cache_read_tokens, 0)),
+               SUM(COALESCE(cache_write_tokens, 0)),
+               COUNT(*),
+               SUM(outcome = 'cancelled'),
+               SUM(outcome IN ('failed', 'rejected'))
+          FROM requests
+         GROUP BY model, provider, product
+    """).fetchall()
     if not rows:
         print("数据库中还没有记录，请先运行 db_import.py。")
         return 0
 
+    # 全量汇总（TOTAL 用）：
     # cost, in, out, reasoning, cache_read, cache_write, n, cancelled, failures
     acc = [0.0] + [0] * 8
-    all_rows = []
-    for model, cost, tok_in, tok_out, tok_reason, cache_r, cache_w, n, canc, fail in rows:
-        for i, v in enumerate((cost, tok_in, tok_out, tok_reason, cache_r, cache_w, n, canc, fail)):
+    by_model: dict[str, list] = {}
+    for r in rows:
+        for i, v in enumerate(r[3:12]):
             acc[i] += v
-        all_rows.append([
-            model, f"{cost:.6f}",
-            fmt_int(tok_in), fmt_int(tok_out), fmt_int(tok_reason),
-            fmt_int(cache_r), fmt_int(cache_w), fmt_int(n),
-            fmt_count_pct(canc, n), fmt_count_pct(fail, n),
-        ])
+        by_model.setdefault(r[0], []).append(r)
 
-    table = list(all_rows if show_all else all_rows[:DEFAULT_ROWS])
-    if len(table) < len(all_rows):                 # 省略了过长的部分
+    def total_of(rs, idx):
+        return sum(x[idx] for x in rs)
+
+    # 组（model）间：该 model 的总花费 desc → 总请求 desc → model 名
+    ordered = sorted(by_model,
+                     key=lambda m: (-total_of(by_model[m], 3),
+                                    -total_of(by_model[m], 9), m))
+    shown = ordered if show_all else ordered[:DEFAULT_ROWS]
+
+    table = []
+    for model in shown:
+        # 组内：花费 desc → 请求 desc → provider → product
+        rs = sorted(by_model[model], key=lambda x: (-x[3], -x[9], x[1], x[2]))
+        for k, (_, provider, product, cost, tok_in, tok_out, tok_reason,
+                cache_r, cache_w, n, canc, fail) in enumerate(rs):
+            if k == 0:                                    # 组的首行写 model 名
+                model_cell = model
+            else:                                         # 同 model 的后续行用连接符
+                model_cell = ("├─" if k < len(rs) - 1 else "└─", "r")
+            table.append([
+                model_cell, f"{provider}({product})" if product else provider,
+                f"{cost:.6f}",
+                fmt_int(tok_in), fmt_int(tok_out), fmt_int(tok_reason),
+                fmt_int(cache_r), fmt_int(cache_w), fmt_int(n),
+                fmt_count_pct(canc, n), fmt_count_pct(fail, n),
+            ])
+
+    if len(shown) < len(ordered):                     # 省略了过长的部分
         table.append(["..."] + [""] * (len(MODELS_HEADERS) - 1))
     table.append([
-        "TOTAL", f"{acc[0]:.6f}",
+        "TOTAL", "", f"{acc[0]:.6f}",
         fmt_int(acc[1]), fmt_int(acc[2]), fmt_int(acc[3]), fmt_int(acc[4]), fmt_int(acc[5]),
         fmt_int(acc[6]),
         fmt_count_pct(acc[7], acc[6]), fmt_count_pct(acc[8], acc[6]),
     ])
 
-    print(f"{len(rows)} model(s)\n")
+    print(f"{len(ordered)} model(s)\n")
     render(MODELS_HEADERS, MODELS_ALIGNS, table,
            separator_before=len(table) - 1, groups=MODELS_GROUPS)
     print("\nlegend:\n"
+          "  provider  = provider(product)；同一 model 按 provider/product 分别汇总，\n"
+          "              同一 model 的后续行以 ├─ / └─ 表示归属\n"
           "  tokens    = 各类型 token 消耗量\n"
           "  requests  = 请求计数：total = 请求总数（去重后）；cancelled = 取消数；\n"
           "              failed = 失败数（failed + rejected）；括号内为占请求总数的比例")
@@ -275,23 +302,27 @@ def build_parser() -> argparse.ArgumentParser:
         "models",
         parents=[common_args(with_tz=False)],
         help="列出花费最高的 model 的花费、token 消耗与失败率",
-        description="列出数据库里的 model，按总花费从高到低（花费相同时按请求数从多到少）"
-                    "给出总花费（USD）、各类 token 消耗"
-                    "（input/output/reasoning/cache read/cache write）"
+        description="按 model + provider + product 分组汇总，列出总花费（USD）、"
+                    "各类 token 消耗（input/output/reasoning/cache read/cache write）"
                     "与取消数、失败数（各带占比）。"
-                    f"默认只列出总花费最高的 {DEFAULT_ROWS} 个，用 --all 查看全部。",
+                    "provider 列打印为 provider(product)；同一 model 的后续行以 ├─ / └─ "
+                    "表示归属。默认只列出总花费最高的 "
+                    f"{DEFAULT_ROWS} 个 model（其下所有 provider/product 行都会显示），"
+                    "用 --all 查看全部。",
         epilog=(
             "示例:\n"
             "  uv run python db_query.py models\n"
             "  uv run python db_query.py models --all\n"
             "  uv run python db_query.py models --db other.db\n\n"
+            "排序：model 之间按该 model 的总花费从高到低（相同再按请求数），\n"
+            "同一 model 内按各行花费从高到低（相同再按请求数）。\n"
             "取消数 = cancelled；失败数 = failed + rejected；"
-            "括号内为占该模型请求总数的比例。"
+            "括号内为占该行请求总数的比例。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     mod_p.add_argument("--all", action="store_true",
-                       help=f"打印完整表格（默认只显示花费最高的 {DEFAULT_ROWS} 个模型）")
+                       help=f"打印完整表格（默认只显示总花费最高的 {DEFAULT_ROWS} 个 model）")
     acc_p = sub.add_parser(
         "accounts",
         parents=[common_args(with_tz=False)],
