@@ -10,7 +10,7 @@
 
 Example:
   uv run python db_import.py
-  uv run python db_import.py --file logs/request-logs-2026-10-15-7d.json
+  uv run python db_import.py --file logs/request-logs-YYYY-MM-DD-24h.json
   uv run python db_import.py --file logs/a.json logs/b.json
   uv run python db_import.py --dry-run
 """
@@ -264,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "示例:\n"
             "  uv run python db_import.py\n"
-            "  uv run python db_import.py --file logs/request-logs-2026-10-15-7d.json\n"
+            "  uv run python db_import.py --file logs/request-logs-YYYY-MM-DD-24h.json\n"
             "  uv run python db_import.py --file logs/a.json logs/b.json\n"
             "  uv run python db_import.py --dry-run\n\n"
             "说明:\n"

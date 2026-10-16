@@ -10,7 +10,7 @@ opencode-usage/
 ├─ tmp/                        临时脚本与草稿（已 gitignore）
 ├─ schema.sql                  建表 + 索引，由 db_import.py 自动执行
 ├─ db_import.py                导入器：幂等导入、去重、台账、冲突登记
-├─ db_query.py                 查询工具：sources / models 子命令
+├─ db_query.py                 查询工具：sources / models / accounts 子命令
 ├─ usage.db                    SQLite 数据库（生成物；已 gitignore）
 └─ README.md
 ```
@@ -34,6 +34,12 @@ uv run python db_query.py sources --db other.db
 
 # 列出所有 model 的花费、token 消耗与请求/取消/失败数
 uv run python db_query.py models
+
+# 按 workspace / 账户 / API Key 列出花费、请求数与 token 消耗（ID 默认截断显示）
+uv run python db_query.py accounts
+
+# 只看完整 ID（不打印表格）
+uv run python db_query.py accounts --full-id
 ```
 
 ## TODO / 开发步骤
@@ -41,7 +47,7 @@ uv run python db_query.py models
 - [x] **1. 分析 `logs/` 中 JSON 的数据结构**（说明文档含私有数据，未纳入仓库）
 - [x] **2. 固化数据模型与指标口径** → `schema.sql`
 - [x] **3. 实现导入器**（sha256 幂等 / `requestID` 去重 / 冲突台账）→ `db_import.py`
-- [x] **4. 查询工具**（已导入文件与数据覆盖范围；按 model 的花费、各类 token 消耗、请求/取消/失败数）→ `db_query.py`（`sources` / `models`）
+- [x] **4. 查询工具**（已导入文件与数据覆盖范围；按 model 的花费、各类 token 消耗、请求/取消/失败数；按 workspace/账户/API Key 的花费与 token 消耗）→ `db_query.py`（`sources` / `models` / `accounts`）
 - [ ] **5. 按模型的聚合报表** → `db_analyze.py`：一期输出
       (1) 按 `model` 主表（附按 `product` 拆分），(2) 总体汇总；支持 `--csv`、`--tz`
 - [ ] **6. 校验与异常报告（延后）**：attempts 重试分布 / 尝试级失败率、异常清单（如 `succeeded` 却无 `cost`）
