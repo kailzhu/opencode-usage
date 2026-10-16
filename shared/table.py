@@ -19,6 +19,10 @@ def render(headers, aligns, rows, separator_before=None, groups=None) -> None:
     def text_of(v):
         return v[0] if isinstance(v, tuple) else v
 
+    if groups is not None and len(groups) != len(headers):
+        raise ValueError("groups must have the same length as headers "
+                         f"(got {len(groups)} groups vs {len(headers)} headers)")
+
     def align_of(v, default):
         return v[1] if isinstance(v, tuple) and len(v) > 1 else default
 
