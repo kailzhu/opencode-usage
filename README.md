@@ -1,95 +1,107 @@
 # opencode-usage
 
-把多个 OpenCode 用量 JSON 日志导入**单个 SQLite 数据库**，按 `request_id` 去重，并按模型分析用量与花费。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-## 目录结构
+Import multiple OpenCode usage JSON logs into a **single SQLite database**, deduplicate
+them by `request_id`, and analyse usage and cost per model.
+
+## Directory layout
 
 ```
 opencode-usage/
-├─ logs/                       原始 JSON 日志（手动放入，只读；已 gitignore）
-├─ tmp/                        临时脚本与草稿（已 gitignore）
-├─ schema.sql                  建表 + 索引，由 db_import.py 自动执行
-├─ db_import.py                导入器：幂等导入、去重、台账、冲突登记
-├─ db_query.py                 查询工具：sources / models / accounts 子命令
-├─ usage.db                    SQLite 数据库（生成物；已 gitignore）
-└─ README.md
+├─ logs/                       raw JSON logs (added manually, read-only; gitignored)
+├─ tmp/                        scratch scripts and drafts (gitignored)
+├─ schema.sql                  tables + indexes, executed by db_import.py
+├─ db_import.py                importer: idempotent load, dedup, ledger, conflict log
+├─ db_query.py                 query tool: sources / models / accounts subcommands
+├─ usage.db                    SQLite database (generated; gitignored)
+├─ README.md                   English docs (this file)
+└─ README.zh-CN.md             Chinese docs
 ```
 
-## 常用命令
+## Usage
 
 ```pwsh
-# 导入（不指定 --file 时，扫描 logs/ 下全部 *.json）
+# Import every *.json under logs/ (when --file is omitted)
 uv run python db_import.py
 
-# 只导入指定文件（可多个，可重复使用 --file）
+# Import specific files (repeatable, several paths allowed)
 uv run python db_import.py --file logs/a.json logs/b.json
 
-# 只解析统计、不写库
+# Parse and report only, without writing to the database
 uv run python db_import.py --dry-run
 
-# 查看已导入的文件、去重统计与数据覆盖范围
+# List imported files, dedup stats and data coverage
 uv run python db_query.py sources
 uv run python db_query.py sources --tz UTC
 uv run python db_query.py sources --db other.db
 
-# 列出所有 model 的花费、token 消耗与请求/取消/失败数
+# Cost, token usage and request/cancelled/failed counts per model
 uv run python db_query.py models
 
-# 按 workspace / 账户 / API Key 列出花费、请求数与 token 消耗（ID 默认截断显示）
+# Cost, request count and token usage by workspace / account / API key
+# (IDs are truncated by default)
 uv run python db_query.py accounts
 
-# 只看完整 ID（不打印表格）
+# Full IDs only, no table
 uv run python db_query.py accounts --full-id
 ```
 
-## TODO / 开发步骤
+## TODO / roadmap
 
-- [x] **1. 分析 `logs/` 中 JSON 的数据结构**（说明文档含私有数据，未纳入仓库）
-- [x] **2. 固化数据模型与指标口径** → `schema.sql`
-- [x] **3. 实现导入器**（sha256 幂等 / `requestID` 去重 / 冲突台账）→ `db_import.py`
-- [x] **4. 查询工具**（已导入文件与数据覆盖范围；按 model 的花费、各类 token 消耗、请求/取消/失败数；按 workspace/账户/API Key 的花费与 token 消耗）→ `db_query.py`（`sources` / `models` / `accounts`）
-- [ ] **5. 按模型的聚合报表** → `db_analyze.py`：一期输出
-      (1) 按 `model` 主表（附按 `product` 拆分），(2) 总体汇总；支持 `--csv`、`--tz`
-- [ ] **6. 校验与异常报告（延后）**：attempts 重试分布 / 尝试级失败率、异常清单（如 `succeeded` 却无 `cost`）
-- [ ] **7. 模型价格表 / 理论成本对照（延后）**
+- [x] **1. Analyse the JSON structure under `logs/`** (the write-up contains private data, so it is not committed)
+- [x] **2. Fix the data model and metric definitions** → `schema.sql`
+- [x] **3. Implement the importer** (sha256 idempotency / `requestID` dedup / conflict log) → `db_import.py`
+- [x] **4. Query tool** (imported files and data coverage; cost, token usage and request/cancelled/failed counts per model; cost and token usage by workspace/account/API key) → `db_query.py` (`sources` / `models` / `accounts`)
+- [ ] **5. Aggregate report per model** → `db_analyze.py`, phase 1 outputs
+      (1) a main table by `model` (with a `product` breakdown), (2) an overall summary; supports `--csv` and `--tz`
+- [ ] **6. Validation and anomaly report (deferred)**: retry distribution / per-attempt failure rate, anomaly list (e.g. `succeeded` without `cost`)
+- [ ] **7. Model price table / theoretical cost comparison (deferred)**
 
-## 导入规则
+## Import rules
 
-1. 扫描 `logs/*.json`，逐个读取 `items` 记录。
-2. 以**文件内容 `sha256`** 判幂等：已导入过的文件直接跳过（重命名/移动也能识别）。
-3. **去重**，以 `request_id` 为键，用全字段规范化哈希 `record_hash` 校验一致性：
-   - 同 `request_id` 且 `record_hash` 相同 → 重复，跳过；
-   - 同 `request_id` 但哈希不同 → **冲突**，记入 `conflicts` 表，**保留首次、不覆盖、不中断**。
-4. `attempts[]` 展开为子表，随父记录一起写入或跳过。
-5. `day_utc` 在导入时按 UTC 由 `startedAt` 推导；源时间存 epoch 毫秒。
-6. 每个文件登记一行台账（`imports`），记录 `truncated`/`until`/数据覆盖范围等元信息（仅存档，不用于过滤——`--complete-only` 已取消）。
+1. Scan `logs/*.json` and read the `items` records one by one.
+2. Idempotency is keyed on the **file content `sha256`**: already-imported files are skipped (renames and moves are still recognised).
+3. **Deduplication** by `request_id`, using a canonical full-record hash `record_hash` to check consistency:
+   - same `request_id` and same `record_hash` → duplicate, skipped;
+   - same `request_id` but a different hash → **conflict**, recorded in the `conflicts` table;
+     **the first write wins, nothing is overwritten, and the import keeps going**.
+4. `attempts[]` is expanded into a child table and written or skipped together with its parent record.
+5. `day_utc` is derived from `startedAt` in UTC at import time; raw timestamps are stored as epoch milliseconds.
+6. Each file gets one ledger row in `imports` recording `truncated` / `until` / data coverage and similar
+   metadata (kept for the record only, not used for filtering — `--complete-only` was dropped).
 
-导入是**幂等的**，可重复运行；写入顺序不影响最终去重结果。
+Importing is **idempotent** and can be re-run; write order does not affect the final deduplicated result.
 
-## 数据模型
+## Data model
 
-完整列定义见 `schema.sql`。
+Full column definitions live in `schema.sql`.
 
-- **`requests`**（PK `request_id`）— 一次 request 一行。顶层标量字段全部成列（含 `model`/`requested_model`/`outcome`/`status_code`/`cost_usd`/各类 token/`day_utc`/`source_file` 等）；`requestHeaders`、`metadata` 只保留在 `raw`（完整 JSON）中。
-- **`attempts`**（PK `(request_id, attempt_index)`）— 一次尝试一行：`provider`/`model`/`status_code`/`duration_ms`/`error_code`。
-- **`imports`**（PK `sha256`）— 导入台账：文件名/路径/字节数/导入时间/记录数/新增/重复/冲突/`truncated`/`until`/数据覆盖起止。
-- **`conflicts`**（PK `(request_id, other_hash)`）— 同 ID 但内容不一致的记录（当前为空）。
+- **`requests`** (PK `request_id`) — one row per request. All top-level scalar fields become columns
+  (including `model`/`requested_model`/`outcome`/`status_code`/`cost_usd`/the token fields/`day_utc`/`source_file`);
+  `requestHeaders` and `metadata` are kept only inside `raw` (the full JSON).
+- **`attempts`** (PK `(request_id, attempt_index)`) — one row per attempt:
+  `provider`/`model`/`status_code`/`duration_ms`/`error_code`.
+- **`imports`** (PK `sha256`) — import ledger: file name/path/bytes/import time/record count/
+  added/duplicate/conflict/`truncated`/`until`/data coverage start and end.
+- **`conflicts`** (PK `(request_id, other_hash)`) — records with the same ID but different content (currently empty).
 
-> `cost_usd` 为 `REAL`，直接存原始 `cost`（单位美元），缺值即 `NULL`。
+> `cost_usd` is `REAL` and stores the raw `cost` (in USD); a missing value is `NULL`.
 
-## 分析口径（按 `model`）
+## Metric definitions (per `model`)
 
-| 指标 | 定义 |
+| Metric | Definition |
 |---|---|
-| 成功率 | `SUM(outcome='succeeded') / COUNT(*)`，另出按 `outcome` 与 `status_code` 的分解 |
-| 平均单次花费（主） | `SUM(COALESCE(cost_usd,0)) / COUNT(*)`（失败请求花费计 0） |
-| 平均单次花费（辅） | `SUM(cost_usd) / 成功请求数` |
-| cache 命中率 | `SUM(cache_read_tokens) / (SUM(input_tokens) + SUM(cache_read_tokens) + SUM(cache_write_tokens))` |
+| Success rate | `SUM(outcome='succeeded') / COUNT(*)`, plus a breakdown by `outcome` and `status_code` |
+| Average cost per request (primary) | `SUM(COALESCE(cost_usd,0)) / COUNT(*)` (failed requests count as 0) |
+| Average cost per request (secondary) | `SUM(cost_usd) / number of successful requests` |
+| Cache hit rate | `SUM(cache_read_tokens) / (SUM(input_tokens) + SUM(cache_read_tokens) + SUM(cache_write_tokens))` |
 
-`db_query.py` 的时间按 `--tz` 显示（默认本机时区，表头标注 `UTC+xx`）。
+`db_query.py` renders times according to `--tz` (default: the local timezone, shown as `UTC+xx` in the header).
 
-## 约定
+## Conventions
 
-- 运行：`uv run python ...`
-- 仅用 Python 标准库（`sqlite3`、`json`），不引入第三方依赖。
-- `logs/`、`usage.db`、`tmp/` 不入版本控制（见 `.gitignore`；日志含 `sk_`/`acc_`/`wrk_` 等敏感标识）。
+- Run with `uv run python ...`
+- Python standard library only (`sqlite3`, `json`); no third-party dependencies.
+- `logs/`, `usage.db` and `tmp/` are not version-controlled (see `.gitignore`; the logs contain
+  sensitive identifiers such as `sk_`/`acc_`/`wrk_`).
