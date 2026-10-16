@@ -223,10 +223,10 @@ __marimo__/
 # 原始日志（含 sk_ / acc_ / wrk_ 等敏感标识）
 logs/
 
-# SQLite 数据库生成物
-usage.db
-usage.db-wal
-usage.db-shm
+# SQLite 数据库生成物（含 -wal / -shm 边车文件）
+*.db
+*.db-wal
+*.db-shm
 
 # 临时脚本与扫描产物
 tmp/
