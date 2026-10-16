@@ -32,13 +32,15 @@ uv run python db_import.py --file logs/a.json logs/b.json
 # Parse and report only, without writing to the database
 uv run python db_import.py --dry-run
 
-# List imported files, dedup stats and data coverage
+# List imported files, dedup stats and data coverage (top 5; --all for all of them)
 uv run python db_query.py sources
+uv run python db_query.py sources --all
 uv run python db_query.py sources --tz UTC
 uv run python db_query.py sources --db other.db
 
-# Cost, token usage and request/cancelled/failed counts per model
+# Cost, token usage and request/cancelled/failed counts per model (top 5; --all for all of them)
 uv run python db_query.py models
+uv run python db_query.py models --all
 
 # Cost, request count and token usage by workspace / account / API key
 # (IDs are truncated by default)
@@ -47,6 +49,11 @@ uv run python db_query.py accounts
 # Full IDs only, no table
 uv run python db_query.py accounts --full-id
 ```
+
+`sources` and `models` list only the first 5 rows by default — the most recently imported files
+and the models with the highest total cost (ties broken by request count). A `...` row between the
+detail rows and `TOTAL` marks the omission; `--all` prints the full table. `TOTAL` always
+summarises the whole dataset, not just the rows shown.
 
 ## TODO / roadmap
 
@@ -62,7 +69,10 @@ uv run python db_query.py accounts --full-id
 ## Import rules
 
 1. Scan `logs/*.json` and read the `items` records one by one.
-2. Idempotency is keyed on the **file content `sha256`**: already-imported files are skipped (renames and moves are still recognised).
+2. Idempotency is keyed on the **file content `sha256`**: an already-imported file is not written
+   again (renames and moves are still recognised). Its records are still compared against the
+   database so `dup` / `conflict` can be reported (`added` is 0), and its ledger row keeps the
+   original `imported_at`.
 3. **Deduplication** by `request_id`, using a canonical full-record hash `record_hash` to check consistency:
    - same `request_id` and same `record_hash` → duplicate, skipped;
    - same `request_id` but a different hash → **conflict**, recorded in the `conflicts` table;
@@ -73,6 +83,10 @@ uv run python db_query.py accounts --full-id
    metadata (kept for the record only, not used for filtering — `--complete-only` was dropped).
 
 Importing is **idempotent** and can be re-run; write order does not affect the final deduplicated result.
+
+Each run ends with a summary table. Files that were already imported appear with a `(skipped)`
+suffix, and the table is followed by a `Total records in database: N` line (the deduplicated number
+of requests in the database).
 
 ## Data model
 
@@ -104,5 +118,6 @@ Full column definitions live in `schema.sql`.
 
 - Run with `uv run python ...`
 - Python standard library only (`sqlite3`, `json`); no third-party dependencies.
-- `logs/`, `usage.db` and `tmp/` are not version-controlled (see `.gitignore`; the logs contain
-  sensitive identifiers such as `sk_`/`acc_`/`wrk_`).
+- `logs/`, `tmp/` and SQLite databases (`*.db`, plus their `-wal`/`-shm` sidecars) are not
+  version-controlled (see `.gitignore`; the logs contain sensitive identifiers such as
+  `sk_`/`acc_`/`wrk_`).

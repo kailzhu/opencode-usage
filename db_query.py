@@ -2,17 +2,21 @@
 """查询 OpenCode 用量数据库。
 
 子命令：
-  sources   列出已导入的文件：文件名、记录数、去重统计、是否被截断、
+  sources   列出最近导入的文件：文件名、记录数、去重统计、是否被截断、
             数据覆盖时间范围，以及导入本数据库的时间。
-  models    列出数据库里所有 model 的总花费、各类 token 消耗、取消率与失败率。
+  models    列出总花费最高的 model：总花费、各类 token 消耗、取消率与失败率。
   accounts  按 workspace / 账户 / API Key 三层列出花费、请求数与各类 token 消耗。
 
 Example:
   uv run python db_query.py sources
-  uv run python db_query.py sources --tz UTC
+  uv run python db_query.py sources --all
   uv run python db_query.py models
   uv run python db_query.py accounts
   uv run python db_query.py accounts --db other.db
+
+sources / models 默认只显示前 5 行（sources 取最近导入的 5 个文件，
+models 取花费最高的 5 个），并用一行 ... 表示省略；--all 打印完整表格。
+TOTAL 行始终按全部记录汇总。
 """
 from __future__ import annotations
 
@@ -25,6 +29,8 @@ from shared.fmt import (fmt_count_pct, fmt_int, fmt_iso, fmt_ms,
                         fmt_span, parse_tz, tz_label, trunc_id)
 from shared.paths import DB_PATH
 from shared.table import render
+
+DEFAULT_ROWS = 5      # sources / models 默认显示的行数；--all 显示全部
 
 SOURCES_HEADERS = ["file name", "records", "added", "dup", "conflict", "trunc",
                    "data from", "data to", "span", "imported at"]
@@ -44,7 +50,7 @@ ACCOUNTS_GROUPS = [None, None, None, None, None,
                    "tokens", "tokens", "tokens", "tokens", "tokens"]
 
 
-def cmd_sources(conn: sqlite3.Connection, tz) -> int:
+def cmd_sources(conn: sqlite3.Connection, tz, show_all: bool = False) -> int:
     rows = conn.execute(
         "SELECT name, records, inserted, duplicates, conflicts, truncated,"
         "       first_started_at, last_finished_at, imported_at"
@@ -54,7 +60,7 @@ def cmd_sources(conn: sqlite3.Connection, tz) -> int:
         print("数据库中还没有导入记录，请先运行 db_import.py。")
         return 0
 
-    table = []
+    all_rows = []
     tot = [0, 0, 0, 0]  # records, inserted, duplicates, conflicts
     g_first = g_last = None
     for (name, records, inserted, dup, conf, trunc, first, last, imported_at) in rows:
@@ -66,13 +72,17 @@ def cmd_sources(conn: sqlite3.Connection, tz) -> int:
             g_first = first if g_first is None else min(g_first, first)
         if last is not None:
             g_last = last if g_last is None else max(g_last, last)
-        table.append([
+        all_rows.append([
             name, records, inserted, dup, conf,
             "yes" if trunc else "no",
             fmt_ms(first, tz), fmt_ms(last, tz),
             fmt_span(first, last),
             fmt_iso(imported_at, tz),
         ])
+
+    table = list(all_rows if show_all else all_rows[:DEFAULT_ROWS])
+    if len(table) < len(all_rows):                 # 省略了过长的部分
+        table.append(["..."] + [""] * (len(SOURCES_HEADERS) - 1))
     table.append([
         "TOTAL", tot[0], tot[1], tot[2], tot[3], "",
         fmt_ms(g_first, tz), fmt_ms(g_last, tz), fmt_span(g_first, g_last), "",
@@ -92,7 +102,7 @@ def cmd_sources(conn: sqlite3.Connection, tz) -> int:
     return 0
 
 
-def cmd_models(conn: sqlite3.Connection) -> int:
+def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
     rows = conn.execute(
         "SELECT model,"
         "       SUM(COALESCE(cost_usd, 0))             AS total_cost,"
@@ -105,7 +115,7 @@ def cmd_models(conn: sqlite3.Connection) -> int:
         "       SUM(outcome = 'cancelled')             AS cancelled,"
         "       SUM(outcome IN ('failed', 'rejected')) AS failures"
         "  FROM requests GROUP BY model"
-        " ORDER BY total_cost DESC, model"
+        " ORDER BY total_cost DESC, requests DESC, model"
     ).fetchall()
     if not rows:
         print("数据库中还没有记录，请先运行 db_import.py。")
@@ -113,16 +123,20 @@ def cmd_models(conn: sqlite3.Connection) -> int:
 
     # cost, in, out, reasoning, cache_read, cache_write, n, cancelled, failures
     acc = [0.0] + [0] * 8
-    table = []
+    all_rows = []
     for model, cost, tok_in, tok_out, tok_reason, cache_r, cache_w, n, canc, fail in rows:
         for i, v in enumerate((cost, tok_in, tok_out, tok_reason, cache_r, cache_w, n, canc, fail)):
             acc[i] += v
-        table.append([
+        all_rows.append([
             model, f"{cost:.6f}",
             fmt_int(tok_in), fmt_int(tok_out), fmt_int(tok_reason),
             fmt_int(cache_r), fmt_int(cache_w), fmt_int(n),
             fmt_count_pct(canc, n), fmt_count_pct(fail, n),
         ])
+
+    table = list(all_rows if show_all else all_rows[:DEFAULT_ROWS])
+    if len(table) < len(all_rows):                 # 省略了过长的部分
+        table.append(["..."] + [""] * (len(MODELS_HEADERS) - 1))
     table.append([
         "TOTAL", f"{acc[0]:.6f}",
         fmt_int(acc[1]), fmt_int(acc[2]), fmt_int(acc[3]), fmt_int(acc[4]), fmt_int(acc[5]),
@@ -238,37 +252,46 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = p.add_subparsers(dest="command", metavar="COMMAND")
-    sub.add_parser(
+    src_p = sub.add_parser(
         "sources",
         parents=[common_args()],
         help="列出已导入的文件及其记录数、去重统计、数据覆盖时间范围",
         description="列出已导入的文件：文件名、记录数、去重统计、是否被截断、"
-                    "数据覆盖时间范围，以及导入本数据库的时间。",
+                    "数据覆盖时间范围，以及导入本数据库的时间。"
+                    f"默认只列出最近导入的 {DEFAULT_ROWS} 个文件，用 --all 查看全部。",
         epilog=(
             "示例:\n"
             "  uv run python db_query.py sources\n"
+            "  uv run python db_query.py sources --all\n"
             "  uv run python db_query.py sources --tz UTC\n"
             "  uv run python db_query.py sources --db other.db\n\n"
             "时间按 --tz 指定的时区显示（默认使用本机时区）。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sub.add_parser(
+    src_p.add_argument("--all", action="store_true",
+                       help=f"打印完整表格（默认只显示最近导入的 {DEFAULT_ROWS} 个文件）")
+    mod_p = sub.add_parser(
         "models",
         parents=[common_args(with_tz=False)],
-        help="列出所有 model 的花费、token 消耗与失败率",
-        description="列出数据库里所有 model，按花费从高到低给出总花费（USD）、"
-                    "各类 token 消耗（input/output/reasoning/cache read/cache write）"
-                    "与取消数、失败数（各带占比）。",
+        help="列出花费最高的 model 的花费、token 消耗与失败率",
+        description="列出数据库里的 model，按总花费从高到低（花费相同时按请求数从多到少）"
+                    "给出总花费（USD）、各类 token 消耗"
+                    "（input/output/reasoning/cache read/cache write）"
+                    "与取消数、失败数（各带占比）。"
+                    f"默认只列出总花费最高的 {DEFAULT_ROWS} 个，用 --all 查看全部。",
         epilog=(
             "示例:\n"
             "  uv run python db_query.py models\n"
+            "  uv run python db_query.py models --all\n"
             "  uv run python db_query.py models --db other.db\n\n"
             "取消数 = cancelled；失败数 = failed + rejected；"
             "括号内为占该模型请求总数的比例。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    mod_p.add_argument("--all", action="store_true",
+                       help=f"打印完整表格（默认只显示花费最高的 {DEFAULT_ROWS} 个模型）")
     acc_p = sub.add_parser(
         "accounts",
         parents=[common_args(with_tz=False)],
@@ -307,7 +330,7 @@ def run_sources(args) -> int:
     if conn is None:
         return 2
     try:
-        return cmd_sources(conn, parse_tz(args.tz))
+        return cmd_sources(conn, parse_tz(args.tz), show_all=args.all)
     finally:
         conn.close()
 
@@ -317,7 +340,7 @@ def run_models(args) -> int:
     if conn is None:
         return 2
     try:
-        return cmd_models(conn)
+        return cmd_models(conn, show_all=args.all)
     finally:
         conn.close()
 

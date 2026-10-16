@@ -31,13 +31,15 @@ uv run python db_import.py --file logs/a.json logs/b.json
 # 只解析统计、不写库
 uv run python db_import.py --dry-run
 
-# 查看已导入的文件、去重统计与数据覆盖范围
+# 查看最近导入的文件、去重统计与数据覆盖范围（默认前 5 行，--all 打印全部）
 uv run python db_query.py sources
+uv run python db_query.py sources --all
 uv run python db_query.py sources --tz UTC
 uv run python db_query.py sources --db other.db
 
-# 列出所有 model 的花费、token 消耗与请求/取消/失败数
+# 列出总花费最高的 model 的花费、token 消耗与请求/取消/失败数（默认前 5 行，--all 打印全部）
 uv run python db_query.py models
+uv run python db_query.py models --all
 
 # 按 workspace / 账户 / API Key 列出花费、请求数与 token 消耗（ID 默认截断显示）
 uv run python db_query.py accounts
@@ -45,6 +47,10 @@ uv run python db_query.py accounts
 # 只看完整 ID（不打印表格）
 uv run python db_query.py accounts --full-id
 ```
+
+`sources` 与 `models` 默认只列前 5 行——分别是最近导入的文件、总花费最高的模型（花费相同时按
+请求数从多到少）。明细与 `TOTAL` 之间会有一行 `...` 表示省略；`--all` 打印完整表格。
+`TOTAL` 行**始终按全量数据汇总**，不受显示行数影响。
 
 ## TODO / 开发步骤
 
@@ -60,7 +66,9 @@ uv run python db_query.py accounts --full-id
 ## 导入规则
 
 1. 扫描 `logs/*.json`，逐个读取 `items` 记录。
-2. 以**文件内容 `sha256`** 判幂等：已导入过的文件直接跳过（重命名/移动也能识别）。
+2. 以**文件内容 `sha256`** 判幂等：已导入过的文件**不再写入**（重命名/移动也能识别）；但仍会
+   逐条与库内比对，以便报告 `dup` / `conflict`（此时 `added` 为 0），台账行的 `imported_at`
+   保持首次导入时间。
 3. **去重**，以 `request_id` 为键，用全字段规范化哈希 `record_hash` 校验一致性：
    - 同 `request_id` 且 `record_hash` 相同 → 重复，跳过；
    - 同 `request_id` 但哈希不同 → **冲突**，记入 `conflicts` 表，**保留首次、不覆盖、不中断**。
@@ -69,6 +77,9 @@ uv run python db_query.py accounts --full-id
 6. 每个文件登记一行台账（`imports`），记录 `truncated`/`until`/数据覆盖范围等元信息（仅存档，不用于过滤——`--complete-only` 已取消）。
 
 导入是**幂等的**，可重复运行；写入顺序不影响最终去重结果。
+
+每次运行结束后打印一张汇总表：已导入过的文件带 `(skipped)` 后缀，表格之后还有一行
+`Total records in database: N`（库内去重后的请求总数）。
 
 ## 数据模型
 
@@ -96,4 +107,5 @@ uv run python db_query.py accounts --full-id
 
 - 运行：`uv run python ...`
 - 仅用 Python 标准库（`sqlite3`、`json`），不引入第三方依赖。
-- `logs/`、`usage.db`、`tmp/` 不入版本控制（见 `.gitignore`；日志含 `sk_`/`acc_`/`wrk_` 等敏感标识）。
+- `logs/`、`tmp/` 与 SQLite 数据库（`*.db`，含 `-wal`/`-shm` 边车文件）不入版本控制
+  （见 `.gitignore`；日志含 `sk_`/`acc_`/`wrk_` 等敏感标识）。
