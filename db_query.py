@@ -5,7 +5,7 @@
   sources   列出最近导入的文件：文件名、记录数、去重统计、是否被截断、
             数据覆盖时间范围，以及导入本数据库的时间。
   models    列出总花费最高的 model（按 provider/product 拆分）：总花费、各类 token 消耗、
-            取消率与失败率。
+            取消率与失败率，以及平均单次花费（总花费 ÷ 被计费的请求数）。
   accounts  按 workspace / 账户 / API Key 三层列出花费、请求数与各类 token 消耗。
 
 Example:
@@ -38,11 +38,12 @@ SOURCES_HEADERS = ["file name", "records", "added", "dup", "conflict", "trunc",
 SOURCES_ALIGNS = ["l", "r", "r", "r", "r", "c", "l", "l", "r", "l"]
 
 MODELS_HEADERS = ["model", "provider", "total cost (usd)", "input", "output",
-                  "reasoning", "cache read", "cache write", "total", "cancelled", "failed"]
-MODELS_ALIGNS = ["r", "l"] + ["r"] * 9
+                  "reasoning", "cache read", "cache write", "total", "cancelled", "failed",
+                  "cost/req"]
+MODELS_ALIGNS = ["r", "l"] + ["r"] * 10
 MODELS_GROUPS = [None, None, None,
                  "tokens", "tokens", "tokens", "tokens", "tokens",
-                 "requests", "requests", "requests"]
+                 "requests", "requests", "requests", None]
 
 ACCOUNTS_HEADERS = ["workspace", "account", "api key", "total cost (usd)", "requests",
                     "input", "output", "reasoning", "cache read", "cache write"]
@@ -104,6 +105,9 @@ def cmd_sources(conn: sqlite3.Connection, tz, show_all: bool = False) -> int:
 
 
 def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
+    # Column layout is positional: the row is sliced as r[3:12] and unpacked into 13
+    # names below. Append any new aggregate at the END — inserting one elsewhere would
+    # silently shift every following column (nothing raises).
     rows = conn.execute("""
         SELECT model,
                COALESCE(provider, '(none)'),
@@ -116,7 +120,8 @@ def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
                SUM(COALESCE(cache_write_tokens, 0)),
                COUNT(*),
                SUM(outcome = 'cancelled'),
-               SUM(outcome IN ('failed', 'rejected'))
+               SUM(outcome IN ('failed', 'rejected')),
+               COALESCE(SUM(cost_usd IS NOT NULL), 0)   -- 被计费的请求数 = cost/req 的分母
           FROM requests
          GROUP BY model, provider, product
     """).fetchall()
@@ -127,10 +132,12 @@ def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
     # 全量汇总（TOTAL 用）：
     # cost, in, out, reasoning, cache_read, cache_write, n, cancelled, failures
     acc = [0.0] + [0] * 8
+    tot_billed = 0            # 被计费请求数合计（cost/req 的分母）
     by_model: dict[str, list] = {}
     for r in rows:
         for i, v in enumerate(r[3:12]):
             acc[i] += v
+        tot_billed += r[12]
         by_model.setdefault(r[0], []).append(r)
 
     def total_of(rs, idx):
@@ -147,7 +154,7 @@ def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
         # 组内：花费 desc → 请求 desc → provider → product
         rs = sorted(by_model[model], key=lambda x: (-x[3], -x[9], x[1], x[2]))
         for k, (_, provider, product, cost, tok_in, tok_out, tok_reason,
-                cache_r, cache_w, n, canc, fail) in enumerate(rs):
+                cache_r, cache_w, n, canc, fail, billed) in enumerate(rs):
             if k == 0:                                    # 组的首行写 model 名
                 model_cell = model
             else:                                         # 同 model 的后续行用连接符
@@ -158,6 +165,7 @@ def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
                 fmt_int(tok_in), fmt_int(tok_out), fmt_int(tok_reason),
                 fmt_int(cache_r), fmt_int(cache_w), fmt_int(n),
                 fmt_count_pct(canc, n), fmt_count_pct(fail, n),
+                f"{cost / billed:.6f}" if billed else "n/a",
             ])
 
     if len(shown) < len(ordered):                     # 省略了过长的部分
@@ -167,6 +175,7 @@ def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
         fmt_int(acc[1]), fmt_int(acc[2]), fmt_int(acc[3]), fmt_int(acc[4]), fmt_int(acc[5]),
         fmt_int(acc[6]),
         fmt_count_pct(acc[7], acc[6]), fmt_count_pct(acc[8], acc[6]),
+        f"{acc[0] / tot_billed:.6f}" if tot_billed else "n/a",
     ])
 
     print(f"{len(ordered)} model(s)\n")
@@ -177,7 +186,10 @@ def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
           "              同一 model 的后续行以 ├─ / └─ 表示归属\n"
           "  tokens    = 各类型 token 消耗量\n"
           "  requests  = 请求计数：total = 请求总数（去重后）；cancelled = 取消数；\n"
-          "              failed = 失败数（failed + rejected）；括号内为占请求总数的比例")
+          "              failed = 失败数（failed + rejected）；括号内为占请求总数的比例\n"
+          "  cost/req (usd) = 该行总花费 ÷ 被计费的请求数（= JSON 里带 cost 字段的记录数）；\n"
+          "              免费模型的成功记录 cost=0 也计入分母，故其均值为 0.000000；\n"
+          "              没有可计费请求时显示 n/a")
     return 0
 
 
@@ -304,7 +316,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="列出花费最高的 model 的花费、token 消耗与失败率",
         description="按 model + provider + product 分组汇总，列出总花费（USD）、"
                     "各类 token 消耗（input/output/reasoning/cache read/cache write）"
-                    "与取消数、失败数（各带占比）。"
+                    "与取消数、失败数（各带占比），"
+                    "以及平均单次花费（该行总花费 ÷ 被计费的请求数）。"
                     "provider 列打印为 provider(product)；同一 model 的后续行以 ├─ / └─ "
                     "表示归属。默认只列出总花费最高的 "
                     f"{DEFAULT_ROWS} 个 model（其下所有 provider/product 行都会显示），"
@@ -317,7 +330,9 @@ def build_parser() -> argparse.ArgumentParser:
             "排序：model 之间按该 model 的总花费从高到低（相同再按请求数），\n"
             "同一 model 内按各行花费从高到低（相同再按请求数）。\n"
             "取消数 = cancelled；失败数 = failed + rejected；"
-            "括号内为占该行请求总数的比例。"
+            "括号内为占该行请求总数的比例。\n"
+            "cost/req = 该行总花费 ÷ **被计费**的请求数（JSON 里带 cost 字段的记录数）；\n"
+            "免费模型的成功记录 cost=0 也计入分母（均值为 0.000000），无可计费请求时为 n/a。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

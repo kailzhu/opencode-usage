@@ -110,6 +110,7 @@ Full column definitions live in `schema.sql`.
 | Success rate | `SUM(outcome='succeeded') / COUNT(*)`, plus a breakdown by `outcome` and `status_code` |
 | Average cost per request (primary) | `SUM(COALESCE(cost_usd,0)) / COUNT(*)` (failed requests count as 0) |
 | Average cost per request (secondary) | `SUM(cost_usd) / number of successful requests` |
+| **Average cost per billed request** — the `cost/req` column printed by `db_query.py models` | `SUM(cost_usd) / COUNT(cost_usd)`. The denominator is the number of records that carry a `cost` field (= the requests that were billed); free models bill `0`, so they still count and their average is `0.000000`. Shows `n/a` when the denominator is 0 |
 | Cache hit rate | `SUM(cache_read_tokens) / (SUM(input_tokens) + SUM(cache_read_tokens) + SUM(cache_write_tokens))` |
 
 `db_query.py` renders times according to `--tz` (default: the local timezone, shown as `UTC+xx` in the header).

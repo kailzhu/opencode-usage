@@ -99,6 +99,7 @@ uv run python db_query.py accounts --full-id
 | 成功率 | `SUM(outcome='succeeded') / COUNT(*)`，另出按 `outcome` 与 `status_code` 的分解 |
 | 平均单次花费（主） | `SUM(COALESCE(cost_usd,0)) / COUNT(*)`（失败请求花费计 0） |
 | 平均单次花费（辅） | `SUM(cost_usd) / 成功请求数` |
+| **平均单次花费（被计费请求）** —— `db_query.py models` 输出的 `cost/req` 列 | `SUM(cost_usd) / COUNT(cost_usd)`。分母 = 带 `cost` 字段的记录数（= 被计费的请求）；免费模型计 0 也算被计费，故其均值为 `0.000000`。分母为 0 时显示 `n/a` |
 | cache 命中率 | `SUM(cache_read_tokens) / (SUM(input_tokens) + SUM(cache_read_tokens) + SUM(cache_write_tokens))` |
 
 `db_query.py` 的时间按 `--tz` 显示（默认本机时区，表头标注 `UTC+xx`）。
