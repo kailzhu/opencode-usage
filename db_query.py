@@ -6,7 +6,8 @@
             数据覆盖时间范围，以及导入本数据库的时间。
   models    列出总花费最高的 model（按 provider/product 拆分）：总花费、各类 token 消耗、
             取消率与失败率，以及平均单次花费（总花费 ÷ 被计费的请求数）。
-  accounts  按 workspace / 账户 / API Key 三层列出花费、请求数与各类 token 消耗。
+  accounts  按 workspace / 账户 / API Key 三层列出花费、请求数、各类 token 消耗
+            与平均单次花费（总花费 ÷ 被计费的请求数）。
 
 Example:
   uv run python db_query.py sources
@@ -46,10 +47,11 @@ MODELS_GROUPS = [None, None, None,
                  "requests", "requests", "requests", None]
 
 ACCOUNTS_HEADERS = ["workspace", "account", "api key", "total cost (usd)", "requests",
-                    "input", "output", "reasoning", "cache read", "cache write"]
-ACCOUNTS_ALIGNS = ["l", "l", "l"] + ["r"] * 7
+                    "input", "output", "reasoning", "cache read", "cache write",
+                    "cost/req"]
+ACCOUNTS_ALIGNS = ["l", "l", "l"] + ["r"] * 8
 ACCOUNTS_GROUPS = [None, None, None, None, None,
-                   "tokens", "tokens", "tokens", "tokens", "tokens"]
+                   "tokens", "tokens", "tokens", "tokens", "tokens", None]
 
 
 def cmd_sources(conn: sqlite3.Connection, tz, show_all: bool = False) -> int:
@@ -194,6 +196,9 @@ def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
 
 
 def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
+    # Column layout is positional: the row is unpacked into 11 names below. Append any
+    # new aggregate at the END — inserting one elsewhere would silently shift every
+    # following column (nothing raises).
     rows = conn.execute(
         "SELECT COALESCE(workspace_id, '(none)'),"
         "       COALESCE(user_id, service_account_id, '(unknown)'),"
@@ -204,7 +209,10 @@ def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
         "       SUM(COALESCE(output_tokens, 0)),"
         "       SUM(COALESCE(reasoning_tokens, 0)),"
         "       SUM(COALESCE(cache_read_tokens, 0)),"
-        "       SUM(COALESCE(cache_write_tokens, 0))"
+        "       SUM(COALESCE(cache_write_tokens, 0)),"
+        # 被计费的请求数 = cost/req 的分母（注意：这是 Python 注释，不能写 SQL 的 --，
+        # 否则隐式拼接后会把后面的 FROM requests 一起注释掉）
+        "       COALESCE(SUM(cost_usd IS NOT NULL), 0)"
         "  FROM requests"
         " GROUP BY workspace_id, user_id, service_account_id, service_api_key_id"
         " ORDER BY workspace_id, SUM(COALESCE(cost_usd, 0)) DESC,"
@@ -231,10 +239,13 @@ def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
 
     # cost, requests, input, output, reasoning, cache_read, cache_write
     acc = [0.0] + [0] * 6
+    tot_billed = 0            # 被计费请求数合计（cost/req 的分母）
     table = []
-    for idx, (ws, account, key, cost, n, tok_in, tok_out, tok_reason, cache_r, cache_w) in enumerate(rows):
+    for idx, (ws, account, key, cost, n, tok_in, tok_out, tok_reason, cache_r, cache_w,
+              billed) in enumerate(rows):
         acc[0] += cost
         acc[1] += n
+        tot_billed += billed
         for i, v in enumerate((tok_in, tok_out, tok_reason, cache_r, cache_w)):
             acc[2 + i] += v
         if idx == 0 or ws != rows[idx - 1][0]:
@@ -246,10 +257,12 @@ def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
             ws_cell, trunc_id(account), trunc_id(key), f"{cost:.6f}", fmt_int(n),
             fmt_int(tok_in), fmt_int(tok_out), fmt_int(tok_reason),
             fmt_int(cache_r), fmt_int(cache_w),
+            f"{cost / billed:.6f}" if billed else "n/a",
         ])
     table.append([
         "TOTAL", "", "", f"{acc[0]:.6f}", fmt_int(acc[1]),
         fmt_int(acc[2]), fmt_int(acc[3]), fmt_int(acc[4]), fmt_int(acc[5]), fmt_int(acc[6]),
+        f"{acc[0] / tot_billed:.6f}" if tot_billed else "n/a",
     ])
 
     n_ws = len({r[0] for r in rows})
@@ -263,6 +276,10 @@ def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
           "  account   = user_id 或 service_account_id（原始 ID）\n"
           "  api key   = service_api_key_id；user 行没有密钥，显示 —\n"
           "  tokens    = 各类型 token 消耗量\n"
+          "  cost/req (usd) = 该行总花费 ÷ 被计费的请求数（= JSON 里带 cost 字段的记录数）；\n"
+          "              ⚠️ 分母**不是**同行的 requests 列（那是全部请求数 COUNT(*)），\n"
+          "              故 cost/req 会大于「总花费 ÷ requests」；免费模型计 0 也算被计费\n"
+          "              （均值 0.000000）；本行没有可计费请求时显示 n/a\n"
           "  ID 已截断显示（保留前缀与尾部）；用 --full-id 查看完整 ID")
     return 0
 
@@ -341,9 +358,10 @@ def build_parser() -> argparse.ArgumentParser:
     acc_p = sub.add_parser(
         "accounts",
         parents=[common_args(with_tz=False)],
-        help="按 workspace / 账户 / API Key 列出花费、请求数与 token 消耗",
+        help="按 workspace / 账户 / API Key 列出花费、请求数、token 消耗与 cost/req",
         description="按 workspace / 账户（user_id 或 service_account_id）/ API Key 三层，"
-                    "列出各主体的总花费（USD）、请求总数与各类 token 消耗。"
+                    "列出各主体的总花费（USD）、请求总数、各类 token 消耗，"
+                    "以及平均单次花费（该行总花费 ÷ 被计费的请求数）。"
                     "user 行没有 API Key，以 — 表示。",
         epilog=(
             "示例:\n"
@@ -352,6 +370,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  uv run python db_query.py accounts --db other.db\n\n"
             "账户 = COALESCE(user_id, service_account_id)；"
             "每行是该主体（或它的一把密钥）的汇总。\n"
+            "cost/req = 该行总花费 ÷ **被计费**的请求数（JSON 里带 cost 字段的记录数），\n"
+            "   注意分母不是同行的 requests 列（那是 COUNT(*)）；无可计费请求时为 n/a。\n"
             "默认将 ID 截断显示（保留前缀与尾部）；--full-id 改为只打印完整 ID。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
