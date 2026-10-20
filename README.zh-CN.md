@@ -37,7 +37,7 @@ uv run python db_query.py accounts [--full-id] [--db other.db]
 查询命令默认只列前 5 行——分别是最近导入的文件（`sources`）、总花费最高的模型
 （`models`，花费相同时按请求数从多到少）。明细与 `TOTAL` 之间会有一行 `...` 表示省略；
 `--all` 打印完整表格。`TOTAL` 行**始终按全量数据汇总**，不受显示行数影响。
-`accounts --full-id` 只打印完整 ID 的缩进树，不打印表格。
+`accounts --full-id` 只打印完整 ID 的缩进树，不打印表格。 `sources` 还会按数据时间排序比对相邻文件，仅在覆盖不连续时在表格下方打印缺口说明（`A -> B: <跨度> missing (...)`）。
 
 ## TODO / 开发步骤
 

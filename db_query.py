@@ -92,8 +92,28 @@ def cmd_sources(conn: sqlite3.Connection, tz, show_all: bool = False) -> int:
         fmt_ms(g_first, tz), fmt_ms(g_last, tz), fmt_span(g_first, g_last), "",
     ])
 
+    gaps = []
+    by_data = sorted(
+        ((rec[0], rec[6], rec[7]) for rec in rows
+         if rec[6] is not None and rec[7] is not None),
+        key=lambda item: (item[1], item[2], item[0]),
+    )
+    cov_end = cov_name = None
+    for name, first, last in by_data:
+        if cov_end is None:
+            cov_end, cov_name = last, name
+        elif first > cov_end:
+            gaps.append((cov_name, name, cov_end, first))
+            cov_end, cov_name = last, name
+        elif last > cov_end:
+            cov_end, cov_name = last, name
     print(f"{len(rows)} file(s) imported   [tz: {tz_label(tz)}]\n")
     render(SOURCES_HEADERS, SOURCES_ALIGNS, table, separator_before=len(table) - 1)
+    if gaps:
+        print("\ngaps (files sorted by data from):")
+        for prev_name, curr_name, gap_from, gap_to in gaps:
+            print(f"  {prev_name} -> {curr_name}: {fmt_span(gap_from, gap_to)} missing"
+                  f" ({fmt_ms(gap_from, tz)} ~ {fmt_ms(gap_to, tz)})")
     print(
         "\nlegend:\n"
         "  records     该文件内的记录总数（含重复）\n"

@@ -39,7 +39,7 @@ List commands show the top 5 rows by default — the most recently imported file
 (`sources`) and the highest-total-cost models (`models`, ties broken by request count).
 A `...` row between the detail rows and `TOTAL` marks the omission; `--all` prints
 the full table. `TOTAL` always summarises the whole dataset, not just the rows shown.
-`accounts --full-id` prints only full IDs as an indented tree, without a table.
+`accounts --full-id` prints only full IDs as an indented tree, without a table. `sources` also sorts files by data time and prints a gap note below the table when coverage is discontinuous (`A -> B: <span> missing (...)`).
 
 ## Roadmap
 
