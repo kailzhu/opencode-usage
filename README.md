@@ -3,7 +3,7 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 Import multiple OpenCode usage JSON logs into a **single SQLite database**, deduplicate
-them by `request_id`, and analyse usage and cost per model.
+them by `request_id`, and analyse usage and cost per model, account or client.
 
 ## Directory layout
 
@@ -12,7 +12,7 @@ opencode-usage/
 ├─ logs/                       raw JSON logs (added manually, read-only; gitignored)
 ├─ schema.sql                  tables + indexes, executed by db_import.py
 ├─ db_import.py                importer: idempotent load, dedup, ledger, conflict log
-├─ db_query.py                 query tool: sources / models / accounts subcommands
+├─ db_query.py                 query tool: sources / models / accounts / clients subcommands
 ├─ shared/                     shared modules: table rendering and formatters
 └─ usage.db                    SQLite database (generated; gitignored)
 ```
@@ -33,17 +33,22 @@ uv run python db_import.py --dry-run
 uv run python db_query.py sources [--all] [--tz UTC] [--db other.db]
 uv run python db_query.py models [--all] [--db other.db]
 uv run python db_query.py accounts [--full-id] [--db other.db]
+uv run python db_query.py clients [--all] [--db other.db]
 ```
 
 List commands show the top 5 rows by default — the most recently imported files
-(`sources`) and the highest-total-cost models (`models`, ties broken by request count).
-A `...` row between the detail rows and `TOTAL` marks the omission; `--all` prints
-the full table. `TOTAL` always summarises the whole dataset, not just the rows shown.
-`accounts --full-id` prints only full IDs as an indented tree, without a table. `sources` also sorts files by data time and prints a gap note below the table when coverage is discontinuous (`A -> B: <span> missing (...)`).
+(`sources`), the highest-total-cost models (`models`) and clients (`clients`), with
+ties broken by request count. A `...` row between the detail rows and `TOTAL` marks
+the omission; `--all` prints the full table. `TOTAL` always summarises the whole
+dataset, not just the rows shown. `accounts --full-id` prints only full IDs as an
+indented tree, without a table.
+
+`sources` scans the files in data-time order and prints a gap note below the table
+when coverage is discontinuous (`A -> B: <span> missing (...)`).
 
 ## Roadmap
 
-- [x] Import + query (`schema.sql`, `db_import.py`, `db_query.py` with `sources` / `models` / `accounts`)
+- [x] Import + query (`schema.sql`, `db_import.py`, `db_query.py` with `sources` / `models` / `accounts` / `clients`)
 - [ ] **Aggregate report per model** → `db_analyze.py`, phase 1 outputs
       (1) a main table by `model` (with a `product` breakdown), (2) an overall summary; supports `--csv` and `--tz`
 - [ ] **Validation and anomaly report (deferred)**: retry distribution / per-attempt failure rate, anomaly list (e.g. `succeeded` without `cost`)
@@ -90,6 +95,11 @@ Full column definitions live in `schema.sql`.
 - `models` groups by `(model, provider, product)`, printed as `provider(product)`,
   ordered by total cost then request count. `accounts` groups by
   `workspace_id` / `COALESCE(user_id, service_account_id)` / API key; user rows render the key as `—`.
+- `clients` groups by the client name derived from `user_agent` (first token, all versions
+  merged): `opencode` also merges desktop + cli, `openai` SDKs become `openai-<lang>`; other
+  clients are whatever the logs contain (e.g. `openclaw`, `opencode-go-copilot`,
+  `codex-desktop`). Falls back to `app`, then `(unknown)`; ordered by total cost then
+  request count.
 
 `db_query.py` renders times according to `--tz` (default: the local timezone, shown as `UTC+xx` in the header).
 

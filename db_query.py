@@ -8,16 +8,19 @@
             取消率与失败率，以及平均单次花费（总花费 ÷ 被计费的请求数）。
   accounts  按 workspace / 账户 / API Key 三层列出花费、请求数、各类 token 消耗
             与平均单次花费（总花费 ÷ 被计费的请求数）。
+  clients   按调用 API 的客户端（由 user_agent 推导）列出花费、请求数、
+            各类 token 消耗与平均单次花费（总花费 ÷ 被计费的请求数）。
 
 Example:
   uv run python db_query.py sources
   uv run python db_query.py sources --all
   uv run python db_query.py models
   uv run python db_query.py accounts
+  uv run python db_query.py clients
   uv run python db_query.py accounts --db other.db
 
-sources / models 默认只显示前 5 行（sources 取最近导入的 5 个文件，
-models 取花费最高的 5 个），并用一行 ... 表示省略；--all 打印完整表格。
+sources / models / clients 默认只显示前 5 行（sources 取最近导入的 5 个文件，
+models、clients 取花费最高的 5 个），并用一行 ... 表示省略；--all 打印完整表格。
 TOTAL 行始终按全部记录汇总。
 """
 from __future__ import annotations
@@ -27,12 +30,12 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from shared.fmt import (fmt_count_pct, fmt_int, fmt_iso, fmt_ms,
+from shared.fmt import (client_name, fmt_count_pct, fmt_int, fmt_iso, fmt_ms,
                         fmt_span, parse_tz, tz_label, trunc_id)
 from shared.paths import DB_PATH
 from shared.table import render
 
-DEFAULT_ROWS = 5      # sources / models 默认显示的行数；--all 显示全部
+DEFAULT_ROWS = 5      # sources / models / clients 默认显示的行数；--all 显示全部
 
 SOURCES_HEADERS = ["file name", "records", "added", "dup", "conflict", "trunc",
                    "data from", "data to", "span", "imported at"]
@@ -52,6 +55,12 @@ ACCOUNTS_HEADERS = ["workspace", "account", "api key", "total cost (usd)", "requ
 ACCOUNTS_ALIGNS = ["l", "l", "l"] + ["r"] * 8
 ACCOUNTS_GROUPS = [None, None, None, None, None,
                    "tokens", "tokens", "tokens", "tokens", "tokens", None]
+
+CLIENTS_HEADERS = ["client", "total cost (usd)", "requests", "input", "output",
+                   "reasoning", "cache read", "cache write", "cost/req"]
+CLIENTS_ALIGNS = ["l"] + ["r"] * 8
+CLIENTS_GROUPS = [None, None, None,
+                  "tokens", "tokens", "tokens", "tokens", "tokens", None]
 
 
 def cmd_sources(conn: sqlite3.Connection, tz, show_all: bool = False) -> int:
@@ -304,6 +313,75 @@ def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
     return 0
 
 
+def cmd_clients(conn: sqlite3.Connection, show_all: bool = False) -> int:
+    # 先按 (app, user_agent) 在 SQL 里汇总（取值很少），再在 Python 里归并成客户端名，
+    # 因为同一个客户端对应多种 user_agent（版本号不同）。
+    rows = conn.execute("""
+        SELECT COALESCE(app, ''),
+               COALESCE(user_agent, ''),
+               SUM(COALESCE(cost_usd, 0)),
+               COUNT(*),
+               SUM(COALESCE(input_tokens, 0)),
+               SUM(COALESCE(output_tokens, 0)),
+               SUM(COALESCE(reasoning_tokens, 0)),
+               SUM(COALESCE(cache_read_tokens, 0)),
+               SUM(COALESCE(cache_write_tokens, 0)),
+               COALESCE(SUM(cost_usd IS NOT NULL), 0)   -- 被计费的请求数 = cost/req 的分母
+          FROM requests
+         GROUP BY app, user_agent
+    """).fetchall()
+    if not rows:
+        print("数据库中还没有记录，请先运行 db_import.py。")
+        return 0
+
+    # cost, n, in, out, reasoning, cache_read, cache_write, billed
+    acc: dict[str, list] = {}
+    for app, ua, cost, n, tok_in, tok_out, tok_reason, cache_r, cache_w, billed in rows:
+        a = acc.setdefault(client_name(app, ua), [0.0, 0, 0, 0, 0, 0, 0, 0])
+        a[0] += cost
+        a[1] += n
+        for i, v in enumerate((tok_in, tok_out, tok_reason, cache_r, cache_w)):
+            a[2 + i] += v
+        a[7] += billed
+
+    # 客户端之间：总花费 desc → 请求 desc → 名字
+    ordered = sorted(acc.items(), key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]))
+    tot = [0.0] + [0] * 7
+    for _, a in ordered:
+        for i, v in enumerate(a):
+            tot[i] += v
+
+    picked = ordered if show_all else ordered[:DEFAULT_ROWS]
+    table = []
+    for name, (cost, n, tok_in, tok_out, tok_reason, cache_r, cache_w, billed) in picked:
+        table.append([
+            name, f"{cost:.6f}", fmt_int(n),
+            fmt_int(tok_in), fmt_int(tok_out), fmt_int(tok_reason),
+            fmt_int(cache_r), fmt_int(cache_w),
+            f"{cost / billed:.6f}" if billed else "n/a",
+        ])
+
+    if len(picked) < len(ordered):                    # 省略了过长的部分
+        table.append(["..."] + [""] * (len(CLIENTS_HEADERS) - 1))
+    table.append([
+        "TOTAL", f"{tot[0]:.6f}", fmt_int(tot[1]),
+        fmt_int(tot[2]), fmt_int(tot[3]), fmt_int(tot[4]), fmt_int(tot[5]), fmt_int(tot[6]),
+        f"{tot[0] / tot[7]:.6f}" if tot[7] else "n/a",
+    ])
+
+    print(f"{len(ordered)} client(s)\n")
+    render(CLIENTS_HEADERS, CLIENTS_ALIGNS, table,
+           separator_before=len(table) - 1, groups=CLIENTS_GROUPS)
+    print("\nlegend:\n"
+          "  client    = 由 user_agent 首段推导（去掉版本号）；opencode 的 desktop / cli\n"
+          "              合并为一行，openai 的 SDK 记为 openai-<语言>；无 user_agent 时回退到 app 列\n"
+          "  tokens    = 各类型 token 消耗量\n"
+          "  requests  = 请求总数（去重后）\n"
+          "  cost/req (usd) = 该行总花费 ÷ 被计费的请求数（= JSON 里带 cost 字段的记录数）；\n"
+          "              免费模型计 0 也算被计费（均值 0.000000）；没有可计费请求时显示 n/a")
+    return 0
+
+
 def common_args(with_tz: bool = True) -> argparse.ArgumentParser:
     """子命令共享的选项：--db（所有子命令）与 --tz（仅显示时间的子命令）。"""
     c = argparse.ArgumentParser(add_help=False)
@@ -398,6 +476,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     acc_p.add_argument("--full-id", action="store_true",
                        help="不打印表格，只打印每个 workspace 下的完整 ID")
+    cli_p = sub.add_parser(
+        "clients",
+        parents=[common_args(with_tz=False)],
+        help="按客户端（user_agent）列出花费、请求数、token 消耗与 cost/req",
+        description="按调用 OpenCode API 的客户端汇总：总花费（USD）、请求总数、"
+                    "各类 token 消耗（input/output/reasoning/cache read/cache write）"
+                    "与平均单次花费（该行总花费 ÷ 被计费的请求数）。"
+                    "客户端名取自 user_agent 首段并去掉版本号：opencode 的 desktop / cli "
+                    "合并为一行，openai 的 SDK 记为 openai-<语言>；"
+                    f"默认只列出总花费最高的 {DEFAULT_ROWS} 个，用 --all 查看全部。",
+        epilog=(
+            "示例:\n"
+            "  uv run python db_query.py clients\n"
+            "  uv run python db_query.py clients --all\n"
+            "  uv run python db_query.py clients --db other.db\n\n"
+            "排序：按总花费从高到低（相同再按请求数）；TOTAL 始终按全量汇总。\n"
+            "cost/req = 该行总花费 ÷ **被计费**的请求数（JSON 里带 cost 字段的记录数），\n"
+            "免费模型计 0 也计入分母；无可计费请求时为 n/a。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cli_p.add_argument("--all", action="store_true",
+                       help=f"打印完整表格（默认只显示总花费最高的 {DEFAULT_ROWS} 个客户端）")
     return p
 
 
@@ -441,6 +542,16 @@ def run_accounts(args) -> int:
         conn.close()
 
 
+def run_clients(args) -> int:
+    conn = connect_ro(args)
+    if conn is None:
+        return 2
+    try:
+        return cmd_clients(conn, show_all=args.all)
+    finally:
+        conn.close()
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -450,6 +561,8 @@ def main(argv=None) -> int:
         return run_models(args)
     if args.command == "accounts":
         return run_accounts(args)
+    if args.command == "clients":
+        return run_clients(args)
     parser.print_help()
     return 0
 

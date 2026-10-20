@@ -6,13 +6,13 @@ CLI tool that imports OpenCode Console usage JSON logs into one
 local SQLite database and queries usage/cost statistics.
 
 - `db_import.py` - importer: idempotent load, `request_id` dedup, ledger, conflict log.
-- `db_query.py` - query tool with subcommands: `sources` / `models` / `accounts`.
+- `db_query.py` - query tool with subcommands: `sources` / `models` / `accounts` / `clients`.
 - `schema.sql` - sole DDL source. Tables: `requests` / `attempts` / `imports` / `conflicts`.
 - `shared/` - shared modules only. No business logic elsewhere:
   - `shared/paths.py` - `ROOT` / `DB_PATH` / `LOGS_DIR` / `SCHEMA_PATH`. Single source of paths.
   - `shared/table.py` - `render()` grid table printer (`+---+` / `|`).
   - `shared/fmt.py` - display formatters (`fmt_int`, `fmt_pct`, `fmt_count_pct`,
-    `trunc_id`, `parse_tz`, `tz_label`, `fmt_ms`, `fmt_span`, `fmt_iso`).
+    `trunc_id`, `client_name`, `parse_tz`, `tz_label`, `fmt_ms`, `fmt_span`, `fmt_iso`).
 - `logs/` - raw JSON logs, added manually, read-only. Never commit (gitignored, contains secrets).
 - `tmp/` - scratch scripts and drafts. Never commit (gitignored).
 - `usage.db` (+ `-wal` / `-shm`) - generated database. Never commit (`*.db` gitignored).
@@ -27,6 +27,7 @@ uv run python db_import.py --dry-run
 uv run python db_query.py sources [--all] [--tz UTC|local|8] [--db other.db]
 uv run python db_query.py models [--all] [--db other.db]
 uv run python db_query.py accounts [--full-id] [--db other.db]
+uv run python db_query.py clients [--all] [--db other.db]
 ```
 
 - Use `uv run python`, not bare `python`.
@@ -70,8 +71,12 @@ uv run python db_query.py accounts [--full-id] [--db other.db]
   - `accounts` groups by `workspace_id x COALESCE(user_id, service_account_id) x service_api_key_id`;
     user rows render the key as em-dash; merge the workspace cell with tree connectors;
     truncate IDs with `trunc_id()` (default width 20); `--full-id` prints only the ID tree, no table.
-  - `sources`/`models` show top 5 by default with a `...` omission row; `TOTAL` always covers
-    the whole dataset. `--all` prints everything.
+  - `clients` groups by `client_name(app, user_agent)` (`shared/fmt.py`): first `user_agent`
+    segment, all versions merged; `opencode`'s desktop/cli merged into one row, `openai`
+    SDKs as `openai-<lang>`, any other token used as-is; falls back to `app`, then
+    `(unknown)`. Orders by total cost then requests.
+  - `sources`/`models`/`clients` show top 5 by default with a `...` omission row; `TOTAL` always
+    covers the whole dataset. `--all` prints everything.
 - Time display: `--tz` accepts `local` / `UTC` / hour offsets (`8`, `+8`, `-5`);
   label with `tz_label()`; format with `fmt_ms()` / `fmt_iso()` / `fmt_span()`.
 

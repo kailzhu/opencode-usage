@@ -31,6 +31,30 @@ def trunc_id(s, width: int = 20) -> str:
     return s[: width - 6] + "…" + s[-5:]
 
 
+# ------------------------------------------------------------------ 客户端
+def client_name(app, user_agent) -> str:
+    """从 app / user_agent 推导客户端名（去掉版本号）。
+
+    取 user_agent 首段：`opencode/latest/2.0.26/desktop` -> `opencode`，
+    `OpenAI/JS 7.23.0` -> `openai-js`，`Codex Desktop/0.163.0` -> `codex-desktop`。
+    opencode 的 desktop / cli 变体合并为一行；缺 user_agent 时回退到 app 列，
+    再回退到 (unknown)。
+    """
+    ua = (user_agent or "").strip()
+    if ua:
+        head, _, rest = ua.partition("/")
+        head = head.strip().lower()
+        if head == "opencode":
+            return "opencode"
+        if head == "openai":
+            lang = rest.split()[0].lower() if rest else ""
+            return f"openai-{lang}" if lang else "openai"
+        return head.replace(" ", "-")
+    app = (app or "").strip().lower()
+    # app 只有 cli / desktop，是 opencode 的两个前端，与上面的合并口径保持一致
+    return "opencode" if app in ("cli", "desktop") else app or "(unknown)"
+
+
 # ------------------------------------------------------------------ 时间 / 时区
 def parse_tz(value: str):
     """把 --tz 值解析成 tzinfo；返回 None 表示用本机时区。

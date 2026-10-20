@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-把多个 OpenCode 用量 JSON 日志导入**单个 SQLite 数据库**，按 `request_id` 去重，并按模型分析用量与花费。
+把多个 OpenCode 用量 JSON 日志导入**单个 SQLite 数据库**，按 `request_id` 去重，并按模型、账户或客户端分析用量与花费。
 
 ## 目录结构
 
@@ -11,7 +11,7 @@ opencode-usage/
 ├─ logs/                       原始 JSON 日志（手动放入，只读；已 gitignore）
 ├─ schema.sql                  建表 + 索引，由 db_import.py 自动执行
 ├─ db_import.py                导入器：幂等导入、去重、台账、冲突登记
-├─ db_query.py                 查询工具：sources / models / accounts 子命令
+├─ db_query.py                 查询工具：sources / models / accounts / clients 子命令
 ├─ shared/                     共享模块：表格渲染与格式化
 └─ usage.db                    SQLite 数据库（生成物；已 gitignore）
 ```
@@ -32,16 +32,20 @@ uv run python db_import.py --dry-run
 uv run python db_query.py sources [--all] [--tz UTC] [--db other.db]
 uv run python db_query.py models [--all] [--db other.db]
 uv run python db_query.py accounts [--full-id] [--db other.db]
+uv run python db_query.py clients [--all] [--db other.db]
 ```
 
 查询命令默认只列前 5 行——分别是最近导入的文件（`sources`）、总花费最高的模型
-（`models`，花费相同时按请求数从多到少）。明细与 `TOTAL` 之间会有一行 `...` 表示省略；
-`--all` 打印完整表格。`TOTAL` 行**始终按全量数据汇总**，不受显示行数影响。
-`accounts --full-id` 只打印完整 ID 的缩进树，不打印表格。 `sources` 还会按数据时间排序比对相邻文件，仅在覆盖不连续时在表格下方打印缺口说明（`A -> B: <跨度> missing (...)`）。
+（`models`）与客户端（`clients`），花费相同时按请求数从多到少。明细与 `TOTAL` 之间
+会有一行 `...` 表示省略；`--all` 打印完整表格。`TOTAL` 行**始终按全量数据汇总**，
+不受显示行数影响。`accounts --full-id` 只打印完整 ID 的缩进树，不打印表格。
+
+`sources` 还会按数据时间顺序扫描相邻文件，仅在覆盖不连续时在表格下方打印缺口说明
+（`A -> B: <跨度> missing (...)`）。
 
 ## TODO / 开发步骤
 
-- [x] 导入 + 查询（`schema.sql`、`db_import.py`、`db_query.py` 的 `sources` / `models` / `accounts`）
+- [x] 导入 + 查询（`schema.sql`、`db_import.py`、`db_query.py` 的 `sources` / `models` / `accounts` / `clients`）
 - [ ] **按模型的聚合报表** → `db_analyze.py`：一期输出
       (1) 按 `model` 主表（附按 `product` 拆分），(2) 总体汇总；支持 `--csv`、`--tz`
 - [ ] **校验与异常报告（延后）**：attempts 重试分布 / 尝试级失败率、异常清单（如 `succeeded` 却无 `cost`）
@@ -84,6 +88,10 @@ uv run python db_query.py accounts [--full-id] [--db other.db]
 - `models` 按 `(model, provider, product)` 分组，打印为 `provider(product)`，
   按总花费（相同再按请求数）排序。`accounts` 按 `workspace_id` /
   `COALESCE(user_id, service_account_id)` / API Key 分组；user 行的 Key 显示为 `—`。
+- `clients` 按由 `user_agent` 推导的客户端名分组（取首段，所有版本合并）：`opencode`
+  还会合并 desktop / cli，`openai` 的 SDK 记作 `openai-<语言>`；其余客户端取决于日志里
+  出现过什么（例如 `openclaw`、`opencode-go-copilot`、`codex-desktop`）。无 UA 时回退到
+  `app` 列，再回退 `(unknown)`；按总花费（相同再按请求数）排序。
 
 `db_query.py` 的时间按 `--tz` 显示（默认本机时区，表头标注 `UTC+xx`）。
 
