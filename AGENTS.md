@@ -25,9 +25,9 @@ uv run python db_import.py
 uv run python db_import.py --file logs/a.json logs/b.json
 uv run python db_import.py --dry-run
 uv run python db_query.py sources [--all] [--tz UTC|local|8] [--db other.db]
-uv run python db_query.py models [--all] [--db other.db]
-uv run python db_query.py accounts [--full-id] [--db other.db]
-uv run python db_query.py clients [--all] [--db other.db]
+uv run python db_query.py models [--all] [--days N] [--tz UTC|local|8] [--db other.db]
+uv run python db_query.py accounts [--full-id] [--days N] [--tz UTC|local|8] [--db other.db]
+uv run python db_query.py clients [--all] [--days N] [--tz UTC|local|8] [--db other.db]
 ```
 
 - Use `uv run python`, not bare `python`.
@@ -79,6 +79,12 @@ uv run python db_query.py clients [--all] [--db other.db]
     covers the whole dataset. `--all` prints everything.
 - Time display: `--tz` accepts `local` / `UTC` / hour offsets (`8`, `+8`, `-5`);
   label with `tz_label()`; format with `fmt_ms()` / `fmt_iso()` / `fmt_span()`.
+- `--days N` (models/accounts/clients only): last N calendar days in the `--tz` zone,
+  window = [00:00 N-1 days ago, +infinity) via `started_at >= cutoff_ms` — the upper end
+  is unbounded, i.e. "to now" as the READMEs phrase it (identical in practice unless the
+  table somehow holds future records); `--days 0` counts as 1, negatives are a parse
+  error; `TOTAL` covers the window; an empty window prints the window plus the newest
+  record in the DB.
 
 ## Docs, Commits, Safety
 

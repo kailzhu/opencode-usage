@@ -28,11 +28,11 @@ uv run python db_import.py --file logs/a.json logs/b.json
 # 只解析统计、不写库
 uv run python db_import.py --dry-run
 
-# 查询命令（都支持 --all 与 --db；sources 还支持 --tz）
+# 查询命令（都支持 --all、--tz 与 --db；models/accounts/clients 还支持 --days）
 uv run python db_query.py sources [--all] [--tz UTC] [--db other.db]
-uv run python db_query.py models [--all] [--db other.db]
-uv run python db_query.py accounts [--full-id] [--db other.db]
-uv run python db_query.py clients [--all] [--db other.db]
+uv run python db_query.py models [--all] [--days 7] [--tz UTC] [--db other.db]
+uv run python db_query.py accounts [--full-id] [--days 7] [--tz UTC] [--db other.db]
+uv run python db_query.py clients [--all] [--days 7] [--tz UTC] [--db other.db]
 ```
 
 查询命令默认只列前 5 行——分别是最近导入的文件（`sources`）、总花费最高的模型
@@ -42,6 +42,10 @@ uv run python db_query.py clients [--all] [--db other.db]
 
 `sources` 还会按数据时间顺序扫描相邻文件，仅在覆盖不连续时在表格下方打印缺口说明
 （`A -> B: <跨度> missing (...)`）。
+
+`models`、`accounts` 与 `clients` 支持 `--days N`，只看所选时区（`--tz`，默认本机时区）
+最近 N 个自然日（`--days 0` 视作 1）：窗口为 N−1 天前 00:00 起至当前，`TOTAL` 按窗口汇总；
+同一命令早晚运行结果可能不同。
 
 ## TODO / 开发步骤
 
@@ -93,7 +97,7 @@ uv run python db_query.py clients [--all] [--db other.db]
   出现过什么（例如 `openclaw`、`opencode-go-copilot`、`codex-desktop`）。无 UA 时回退到
   `app` 列，再回退 `(unknown)`；按总花费（相同再按请求数）排序。
 
-`db_query.py` 的时间按 `--tz` 显示（默认本机时区，表头标注 `UTC+xx`）。
+`db_query.py` 的时间按 `--tz` 显示（默认本机时区，表头标注 `UTC+xx`）；`--days` 窗口按同一时区划分。
 
 ## 约定
 

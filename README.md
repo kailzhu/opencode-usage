@@ -29,11 +29,11 @@ uv run python db_import.py --file logs/a.json logs/b.json
 # Parse and report only, without writing to the database
 uv run python db_import.py --dry-run
 
-# List commands (all take --all and --db; sources also takes --tz)
+# List commands (all take --all, --tz and --db; models/accounts/clients take --days)
 uv run python db_query.py sources [--all] [--tz UTC] [--db other.db]
-uv run python db_query.py models [--all] [--db other.db]
-uv run python db_query.py accounts [--full-id] [--db other.db]
-uv run python db_query.py clients [--all] [--db other.db]
+uv run python db_query.py models [--all] [--days 7] [--tz UTC] [--db other.db]
+uv run python db_query.py accounts [--full-id] [--days 7] [--tz UTC] [--db other.db]
+uv run python db_query.py clients [--all] [--days 7] [--tz UTC] [--db other.db]
 ```
 
 List commands show the top 5 rows by default — the most recently imported files
@@ -45,6 +45,11 @@ indented tree, without a table.
 
 `sources` scans the files in data-time order and prints a gap note below the table
 when coverage is discontinuous (`A -> B: <span> missing (...)`).
+
+`models`, `accounts` and `clients` take `--days N` for the last N calendar days in the
+`--tz` zone (default: local; `--days 0` counts as 1): the window runs from 00:00 N-1 days
+ago to now, `TOTAL` covers the window, and the same command run in the morning vs
+evening can give different totals.
 
 ## Roadmap
 
@@ -101,7 +106,7 @@ Full column definitions live in `schema.sql`.
   `codex-desktop`). Falls back to `app`, then `(unknown)`; ordered by total cost then
   request count.
 
-`db_query.py` renders times according to `--tz` (default: the local timezone, shown as `UTC+xx` in the header).
+`db_query.py` renders times according to `--tz` (default: the local timezone, shown as `UTC+xx` in the header); `--days` windows are drawn in the same zone.
 
 ## Conventions
 

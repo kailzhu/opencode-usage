@@ -21,13 +21,14 @@ Example:
 
 sources / models / clients 默认只显示前 5 行（sources 取最近导入的 5 个文件，
 models、clients 取花费最高的 5 个），并用一行 ... 表示省略；--all 打印完整表格。
-TOTAL 行始终按全部记录汇总。
+TOTAL 行始终按全部记录汇总（加 --days 时按窗口内全量汇总）。
 """
 from __future__ import annotations
 
 import argparse
 import sqlite3
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from shared.fmt import (client_name, fmt_count_pct, fmt_int, fmt_iso, fmt_ms,
@@ -62,6 +63,61 @@ CLIENTS_ALIGNS = ["l"] + ["r"] * 8
 CLIENTS_GROUPS = [None, None, None,
                   "tokens", "tokens", "tokens", "tokens", "tokens", None]
 
+
+def days_type(value: str) -> int:
+    """--days 的取值：正整数；0 视作 1。"""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"天数必须是整数：{value!r}")
+    if number < 0:
+        raise argparse.ArgumentTypeError("--days 不能为负数")
+    return max(number, 1)
+
+
+def add_days_arg(sub_parser: argparse.ArgumentParser) -> None:
+    """给 models / accounts / clients 添加 --days 选项。"""
+    sub_parser.add_argument("--days", type=days_type, default=None, metavar="N",
+                            help="只统计最近 N 个自然日（0 视作 1；默认统计全部记录）")
+
+
+# --days 的长说明：三个子命令的 epilog 共用，改这里即三处同时生效。
+DAYS_EPILOG = (
+    "\n--days N    只统计最近 N 个自然日：窗口为所选时区今天 00:00 起往前 N 天\n"
+    "            （--days 0 视作 1；默认统计全部；TOTAL 按窗口内全量汇总）。\n"
+    "            窗口锚定当前时间，同一命令早晚运行结果可能不同。"
+)
+
+
+def days_window(tz, days: int):
+    """最近 days 个自然日的窗口：返回 (cutoff_ms, label)。窗口为所选时区今天 00:00 起往前 days 天，调用方用 started_at >= cutoff_ms 过滤。"""
+    today = datetime.now(tz).date()
+    start = today - timedelta(days=days - 1)
+    cutoff_ms = int(datetime(start.year, start.month, start.day, tzinfo=tz).timestamp() * 1000)
+    return cutoff_ms, f"last {days} calendar day(s) [{tz_label(tz)}]: {start} ~ {today}"
+
+
+def resolve_days(args, tz):
+    """由 --days 算出 (cutoff_ms, label)；未指定时返回 (None, "")。"""
+    if args.days is None:
+        return None, ""
+    return days_window(tz, args.days)
+
+
+def title_with_window(base: str, window: str) -> str:
+    return f"{base}, {window}" if window else base
+
+
+def print_no_rows(conn: sqlite3.Connection, tz, window) -> None:
+    """空结果提示：区分「库为空」与「窗口内为空」两种情况。"""
+    total, latest = conn.execute(
+        "SELECT COUNT(*), MAX(started_at) FROM requests").fetchone()
+    if not total:
+        print("数据库中还没有记录，请先运行 db_import.py。")
+        return
+    print(f"窗口（{window}）内没有记录。")
+    if latest is not None:
+        print(f"库内最新记录：{fmt_ms(latest, tz)}；请增大 --days 或导入更新的日志。")
 
 def cmd_sources(conn: sqlite3.Connection, tz, show_all: bool = False) -> int:
     rows = conn.execute(
@@ -135,11 +191,14 @@ def cmd_sources(conn: sqlite3.Connection, tz, show_all: bool = False) -> int:
     return 0
 
 
-def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
+def cmd_models(conn: sqlite3.Connection, tz, show_all: bool = False,
+               cutoff_ms=None, window="") -> int:
+    where = " WHERE started_at >= ?" if cutoff_ms is not None else ""
+    params: tuple = (cutoff_ms,) if cutoff_ms is not None else ()
     # Column layout is positional: the row is sliced as r[3:12] and unpacked into 13
     # names below. Append any new aggregate at the END — inserting one elsewhere would
     # silently shift every following column (nothing raises).
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT model,
                COALESCE(provider, '(none)'),
                COALESCE(product, ''),
@@ -153,11 +212,11 @@ def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
                SUM(outcome = 'cancelled'),
                SUM(outcome IN ('failed', 'rejected')),
                COALESCE(SUM(cost_usd IS NOT NULL), 0)   -- 被计费的请求数 = cost/req 的分母
-          FROM requests
+          FROM requests{where}
          GROUP BY model, provider, product
-    """).fetchall()
+    """, params).fetchall()
     if not rows:
-        print("数据库中还没有记录，请先运行 db_import.py。")
+        print_no_rows(conn, tz, window)
         return 0
 
     # 全量汇总（TOTAL 用）：
@@ -209,7 +268,7 @@ def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
         f"{acc[0] / tot_billed:.6f}" if tot_billed else "n/a",
     ])
 
-    print(f"{len(ordered)} model(s)\n")
+    print(title_with_window(f"{len(ordered)} model(s)", window) + "\n")
     render(MODELS_HEADERS, MODELS_ALIGNS, table,
            separator_before=len(table) - 1, groups=MODELS_GROUPS)
     print("\nlegend:\n"
@@ -224,7 +283,10 @@ def cmd_models(conn: sqlite3.Connection, show_all: bool = False) -> int:
     return 0
 
 
-def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
+def cmd_accounts(conn: sqlite3.Connection, tz, full_id: bool = False,
+                 cutoff_ms=None, window="") -> int:
+    where = " WHERE started_at >= ?" if cutoff_ms is not None else ""
+    params: tuple = (cutoff_ms,) if cutoff_ms is not None else ()
     # Column layout is positional: the row is unpacked into 11 names below. Append any
     # new aggregate at the END — inserting one elsewhere would silently shift every
     # following column (nothing raises).
@@ -242,13 +304,13 @@ def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
         # 被计费的请求数 = cost/req 的分母（注意：这是 Python 注释，不能写 SQL 的 --，
         # 否则隐式拼接后会把后面的 FROM requests 一起注释掉）
         "       COALESCE(SUM(cost_usd IS NOT NULL), 0)"
-        "  FROM requests"
+        f"  FROM requests{where}"
         " GROUP BY workspace_id, user_id, service_account_id, service_api_key_id"
         " ORDER BY workspace_id, SUM(COALESCE(cost_usd, 0)) DESC,"
-        "          COALESCE(user_id, service_account_id)"
-    ).fetchall()
+        "          COALESCE(user_id, service_account_id)",
+        params).fetchall()
     if not rows:
-        print("数据库中还没有记录，请先运行 db_import.py。")
+        print_no_rows(conn, tz, window)
         return 0
 
     if full_id:                                  # 只列 ID，不打印表格
@@ -257,7 +319,7 @@ def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
             tree.setdefault(ws, {}).setdefault(account, [])
             if key:
                 tree[ws][account].append(key)
-        print(f"{len(tree)} workspace(s)\n")
+        print(title_with_window(f"{len(tree)} workspace(s)", window) + "\n")
         for ws, accounts in tree.items():
             print(f"workspace  {ws}")
             for account, keys in accounts.items():
@@ -297,7 +359,7 @@ def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
     n_ws = len({r[0] for r in rows})
     n_acct = len({(r[0], r[1]) for r in rows})
     n_key = sum(1 for r in rows if r[2])
-    print(f"{n_ws} workspace(s) | {n_acct} account(s) | {n_key} key(s)\n")
+    print(title_with_window(f"{n_ws} workspace(s) | {n_acct} account(s) | {n_key} key(s)", window) + "\n")
     render(ACCOUNTS_HEADERS, ACCOUNTS_ALIGNS, table,
            separator_before=len(table) - 1, groups=ACCOUNTS_GROUPS)
     print("\nlegend:\n"
@@ -313,10 +375,13 @@ def cmd_accounts(conn: sqlite3.Connection, full_id: bool = False) -> int:
     return 0
 
 
-def cmd_clients(conn: sqlite3.Connection, show_all: bool = False) -> int:
+def cmd_clients(conn: sqlite3.Connection, tz, show_all: bool = False,
+                cutoff_ms=None, window="") -> int:
+    where = " WHERE started_at >= ?" if cutoff_ms is not None else ""
+    params: tuple = (cutoff_ms,) if cutoff_ms is not None else ()
     # 先按 (app, user_agent) 在 SQL 里汇总（取值很少），再在 Python 里归并成客户端名，
     # 因为同一个客户端对应多种 user_agent（版本号不同）。
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT COALESCE(app, ''),
                COALESCE(user_agent, ''),
                SUM(COALESCE(cost_usd, 0)),
@@ -327,11 +392,11 @@ def cmd_clients(conn: sqlite3.Connection, show_all: bool = False) -> int:
                SUM(COALESCE(cache_read_tokens, 0)),
                SUM(COALESCE(cache_write_tokens, 0)),
                COALESCE(SUM(cost_usd IS NOT NULL), 0)   -- 被计费的请求数 = cost/req 的分母
-          FROM requests
+          FROM requests{where}
          GROUP BY app, user_agent
-    """).fetchall()
+    """, params).fetchall()
     if not rows:
-        print("数据库中还没有记录，请先运行 db_import.py。")
+        print_no_rows(conn, tz, window)
         return 0
 
     # cost, n, in, out, reasoning, cache_read, cache_write, billed
@@ -369,7 +434,7 @@ def cmd_clients(conn: sqlite3.Connection, show_all: bool = False) -> int:
         f"{tot[0] / tot[7]:.6f}" if tot[7] else "n/a",
     ])
 
-    print(f"{len(ordered)} client(s)\n")
+    print(title_with_window(f"{len(ordered)} client(s)", window) + "\n")
     render(CLIENTS_HEADERS, CLIENTS_ALIGNS, table,
            separator_before=len(table) - 1, groups=CLIENTS_GROUPS)
     print("\nlegend:\n"
@@ -383,7 +448,7 @@ def cmd_clients(conn: sqlite3.Connection, show_all: bool = False) -> int:
 
 
 def common_args(with_tz: bool = True) -> argparse.ArgumentParser:
-    """子命令共享的选项：--db（所有子命令）与 --tz（仅显示时间的子命令）。"""
+    """子命令共享的选项：--db（所有子命令）与 --tz（显示时间与 --days 窗口划分的时区）。"""
     c = argparse.ArgumentParser(add_help=False)
     c.add_argument("--db", default=str(DB_PATH), metavar="PATH",
                    help=f"SQLite 数据库路径（默认: {DB_PATH.name}）")
@@ -427,7 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help=f"打印完整表格（默认只显示最近导入的 {DEFAULT_ROWS} 个文件）")
     mod_p = sub.add_parser(
         "models",
-        parents=[common_args(with_tz=False)],
+        parents=[common_args()],
         help="列出花费最高的 model 的花费、token 消耗与失败率",
         description="按 model + provider + product 分组汇总，列出总花费（USD）、"
                     "各类 token 消耗（input/output/reasoning/cache read/cache write）"
@@ -436,7 +501,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "provider 列打印为 provider(product)；同一 model 的后续行以 ├─ / └─ "
                     "表示归属。默认只列出总花费最高的 "
                     f"{DEFAULT_ROWS} 个 model（其下所有 provider/product 行都会显示），"
-                    "用 --all 查看全部。",
+                    "用 --all 查看全部。"
+                    "可用 --days N 只看最近 N 个自然日（按 --tz 时区划分）。",
         epilog=(
             "示例:\n"
             "  uv run python db_query.py models\n"
@@ -448,19 +514,21 @@ def build_parser() -> argparse.ArgumentParser:
             "括号内为占该行请求总数的比例。\n"
             "cost/req = 该行总花费 ÷ **被计费**的请求数（JSON 里带 cost 字段的记录数）；\n"
             "免费模型的成功记录 cost=0 也计入分母（均值为 0.000000），无可计费请求时为 n/a。"
-        ),
+        ) + DAYS_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     mod_p.add_argument("--all", action="store_true",
                        help=f"打印完整表格（默认只显示总花费最高的 {DEFAULT_ROWS} 个 model）")
+    add_days_arg(mod_p)
     acc_p = sub.add_parser(
         "accounts",
-        parents=[common_args(with_tz=False)],
+        parents=[common_args()],
         help="按 workspace / 账户 / API Key 列出花费、请求数、token 消耗与 cost/req",
         description="按 workspace / 账户（user_id 或 service_account_id）/ API Key 三层，"
                     "列出各主体的总花费（USD）、请求总数、各类 token 消耗，"
                     "以及平均单次花费（该行总花费 ÷ 被计费的请求数）。"
-                    "user 行没有 API Key，以 — 表示。",
+                    "user 行没有 API Key，以 — 表示。"
+                    "可用 --days N 只看最近 N 个自然日（按 --tz 时区划分）。",
         epilog=(
             "示例:\n"
             "  uv run python db_query.py accounts\n"
@@ -471,34 +539,38 @@ def build_parser() -> argparse.ArgumentParser:
             "cost/req = 该行总花费 ÷ **被计费**的请求数（JSON 里带 cost 字段的记录数），\n"
             "   注意分母不是同行的 requests 列（那是 COUNT(*)）；无可计费请求时为 n/a。\n"
             "默认将 ID 截断显示（保留前缀与尾部）；--full-id 改为只打印完整 ID。"
-        ),
+        ) + DAYS_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     acc_p.add_argument("--full-id", action="store_true",
                        help="不打印表格，只打印每个 workspace 下的完整 ID")
+    add_days_arg(acc_p)
     cli_p = sub.add_parser(
         "clients",
-        parents=[common_args(with_tz=False)],
+        parents=[common_args()],
         help="按客户端（user_agent）列出花费、请求数、token 消耗与 cost/req",
         description="按调用 OpenCode API 的客户端汇总：总花费（USD）、请求总数、"
                     "各类 token 消耗（input/output/reasoning/cache read/cache write）"
                     "与平均单次花费（该行总花费 ÷ 被计费的请求数）。"
                     "客户端名取自 user_agent 首段并去掉版本号：opencode 的 desktop / cli "
                     "合并为一行，openai 的 SDK 记为 openai-<语言>；"
-                    f"默认只列出总花费最高的 {DEFAULT_ROWS} 个，用 --all 查看全部。",
+                    f"默认只列出总花费最高的 {DEFAULT_ROWS} 个，用 --all 查看全部。"
+                    "可用 --days N 只看最近 N 个自然日（按 --tz 时区划分）。",
         epilog=(
             "示例:\n"
             "  uv run python db_query.py clients\n"
             "  uv run python db_query.py clients --all\n"
             "  uv run python db_query.py clients --db other.db\n\n"
-            "排序：按总花费从高到低（相同再按请求数）；TOTAL 始终按全量汇总。\n"
+            "排序：按总花费从高到低（相同再按请求数）；"
+            "TOTAL 按时间窗口内全量汇总（无 --days 时即全库）。\n"
             "cost/req = 该行总花费 ÷ **被计费**的请求数（JSON 里带 cost 字段的记录数），\n"
             "免费模型计 0 也计入分母；无可计费请求时为 n/a。"
-        ),
+        ) + DAYS_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     cli_p.add_argument("--all", action="store_true",
                        help=f"打印完整表格（默认只显示总花费最高的 {DEFAULT_ROWS} 个客户端）")
+    add_days_arg(cli_p)
     return p
 
 
@@ -527,7 +599,9 @@ def run_models(args) -> int:
     if conn is None:
         return 2
     try:
-        return cmd_models(conn, show_all=args.all)
+        tz = parse_tz(args.tz)
+        cutoff_ms, window = resolve_days(args, tz)
+        return cmd_models(conn, tz, show_all=args.all, cutoff_ms=cutoff_ms, window=window)
     finally:
         conn.close()
 
@@ -537,7 +611,9 @@ def run_accounts(args) -> int:
     if conn is None:
         return 2
     try:
-        return cmd_accounts(conn, full_id=args.full_id)
+        tz = parse_tz(args.tz)
+        cutoff_ms, window = resolve_days(args, tz)
+        return cmd_accounts(conn, tz, full_id=args.full_id, cutoff_ms=cutoff_ms, window=window)
     finally:
         conn.close()
 
@@ -547,7 +623,9 @@ def run_clients(args) -> int:
     if conn is None:
         return 2
     try:
-        return cmd_clients(conn, show_all=args.all)
+        tz = parse_tz(args.tz)
+        cutoff_ms, window = resolve_days(args, tz)
+        return cmd_clients(conn, tz, show_all=args.all, cutoff_ms=cutoff_ms, window=window)
     finally:
         conn.close()
 
