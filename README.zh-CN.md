@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-把多个 OpenCode 用量 JSON 日志导入**单个 SQLite 数据库**，按 `request_id` 去重，并按模型、账户或客户端分析用量与花费。
+把多个 OpenCode 用量 JSON 日志导入**单个 SQLite 数据库**，按 `request_id` 去重，并按模型、账户、客户端或 session 分析用量与花费。
 
 ## 目录结构
 
@@ -11,7 +11,7 @@ opencode-usage/
 ├─ logs/                       原始 JSON 日志（手动放入，只读；已 gitignore）
 ├─ schema.sql                  建表 + 索引，由 db_import.py 自动执行
 ├─ db_import.py                导入器：幂等导入、去重、台账、冲突登记
-├─ db_query.py                 查询工具：sources / models / accounts / clients 子命令
+├─ db_query.py                 查询工具：sources / models / accounts / clients / sessions 子命令
 ├─ shared/                     共享模块：表格渲染与格式化
 └─ usage.db                    SQLite 数据库（生成物；已 gitignore）
 ```
@@ -28,28 +28,29 @@ uv run python db_import.py --file logs/a.json logs/b.json
 # 只解析统计、不写库
 uv run python db_import.py --dry-run
 
-# 查询命令（都支持 --all、--tz 与 --db；models/accounts/clients 还支持 --days）
+# 查询命令（都支持 --all、--tz 与 --db；models/accounts/clients/sessions 还支持 --days）
 uv run python db_query.py sources [--all] [--tz UTC] [--db other.db]
 uv run python db_query.py models [--all] [--days 7] [--tz UTC] [--db other.db]
 uv run python db_query.py accounts [--full-id] [--days 7] [--tz UTC] [--db other.db]
 uv run python db_query.py clients [--all] [--days 7] [--tz UTC] [--db other.db]
+uv run python db_query.py sessions [--all] [--days 7] [--tz UTC] [--db other.db]
 ```
 
 查询命令默认只列前 5 行——分别是最近导入的文件（`sources`）、总花费最高的模型
-（`models`）与客户端（`clients`），花费相同时按请求数从多到少。明细与 `TOTAL` 之间
-会有一行 `...` 表示省略；`--all` 打印完整表格。`TOTAL` 行**始终按全量数据汇总**，
-不受显示行数影响。`accounts --full-id` 只打印完整 ID 的缩进树，不打印表格。
+（`models`）、客户端（`clients`）与 session（`sessions`），花费相同时按请求数从多到少。
+明细与 `TOTAL` 之间会有一行 `...` 表示省略；`--all` 打印完整表格。`TOTAL` 行
+**始终按全量数据汇总**，不受显示行数影响。`accounts --full-id` 只打印完整 ID 的缩进树，不打印表格。
 
 `sources` 还会按数据时间顺序扫描相邻文件，仅在覆盖不连续时在表格下方打印缺口说明
 （`A -> B: <跨度> missing (...)`）。
 
-`models`、`accounts` 与 `clients` 支持 `--days N`，只看所选时区（`--tz`，默认本机时区）
+`models`、`accounts`、`clients` 与 `sessions` 支持 `--days N`，只看所选时区（`--tz`，默认本机时区）
 最近 N 个自然日（`--days 0` 视作 1）：窗口为 N−1 天前 00:00 起至当前，`TOTAL` 按窗口汇总；
 同一命令早晚运行结果可能不同。
 
 ## TODO / 开发步骤
 
-- [x] 导入 + 查询（`schema.sql`、`db_import.py`、`db_query.py` 的 `sources` / `models` / `accounts` / `clients`）
+- [x] 导入 + 查询（`schema.sql`、`db_import.py`、`db_query.py` 的 `sources` / `models` / `accounts` / `clients` / `sessions`）
 - [ ] **按模型的聚合报表** → `db_analyze.py`：一期输出
       (1) 按 `model` 主表（附按 `product` 拆分），(2) 总体汇总；支持 `--csv`、`--tz`
 - [ ] **校验与异常报告（延后）**：attempts 重试分布 / 尝试级失败率、异常清单（如 `succeeded` 却无 `cost`）
@@ -96,6 +97,11 @@ uv run python db_query.py clients [--all] [--days 7] [--tz UTC] [--db other.db]
   还会合并 desktop / cli，`openai` 的 SDK 记作 `openai-<语言>`；其余客户端取决于日志里
   出现过什么（例如 `openclaw`、`opencode-go-copilot`、`codex-desktop`）。无 UA 时回退到
   `app` 列，再回退 `(unknown)`；按总花费（相同再按请求数）排序。
+- `sessions` 按 `session_id` 分组（表中截断显示，空值显示 `(none)`），按总花费
+  （相同再按请求数）排序。token 列与 `clients` 一样展开为五类明细，不额外打印合计列。
+  `updated` / `client` / `model` 取该 session 在当前 `--days` 窗口内最新一条请求的值
+  （按 `started_at`，并列时依次按 `finished_at`、`request_id`）；`updated` 为该请求的开始时间，
+  按 `--tz` 显示且精确到分钟；`client` 的推导口径与 `clients` 相同。
 
 `db_query.py` 的时间按 `--tz` 显示（默认本机时区，表头标注 `UTC+xx`）；`--days` 窗口按同一时区划分。
 

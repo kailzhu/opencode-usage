@@ -6,7 +6,7 @@ CLI tool that imports OpenCode Console usage JSON logs into one
 local SQLite database and queries usage/cost statistics.
 
 - `db_import.py` - importer: idempotent load, `request_id` dedup, ledger, conflict log.
-- `db_query.py` - query tool with subcommands: `sources` / `models` / `accounts` / `clients`.
+- `db_query.py` - query tool with subcommands: `sources` / `models` / `accounts` / `clients` / `sessions`.
 - `schema.sql` - sole DDL source. Tables: `requests` / `attempts` / `imports` / `conflicts`.
 - `shared/` - shared modules only. No business logic elsewhere:
   - `shared/paths.py` - `ROOT` / `DB_PATH` / `LOGS_DIR` / `SCHEMA_PATH`. Single source of paths.
@@ -28,6 +28,7 @@ uv run python db_query.py sources [--all] [--tz UTC|local|8] [--db other.db]
 uv run python db_query.py models [--all] [--days N] [--tz UTC|local|8] [--db other.db]
 uv run python db_query.py accounts [--full-id] [--days N] [--tz UTC|local|8] [--db other.db]
 uv run python db_query.py clients [--all] [--days N] [--tz UTC|local|8] [--db other.db]
+uv run python db_query.py sessions [--all] [--days N] [--tz UTC|local|8] [--db other.db]
 ```
 
 - Use `uv run python`, not bare `python`.
@@ -75,12 +76,17 @@ uv run python db_query.py clients [--all] [--days N] [--tz UTC|local|8] [--db ot
     segment, all versions merged; `opencode`'s desktop/cli merged into one row, `openai`
     SDKs as `openai-<lang>`, any other token used as-is; falls back to `app`, then
     `(unknown)`. Orders by total cost then requests.
-  - `sources`/`models`/`clients` show top 5 by default with a `...` omission row; `TOTAL` always
-    covers the whole dataset. `--all` prints everything.
+  - `sessions` groups by `session_id` (NULL -> `(none)`, `trunc_id()` for display): cost,
+    requests, five token categories, `cost/req`, `updated`, `client`, `model`. `updated` /
+    `client` / `model` come from the latest request in the window (`started_at`, then
+    `finished_at`, then `request_id`); `client` uses `client_name()`, `updated` is minute
+    precision. Orders by total cost then requests.
+  - `sources`/`models`/`clients`/`sessions` show top 5 by default with a `...` omission
+    row; `TOTAL` always covers the whole dataset. `--all` prints everything.
 - Time display: `--tz` accepts `local` / `UTC` / hour offsets (`8`, `+8`, `-5`);
   label with `tz_label()`; format with `fmt_ms()` / `fmt_iso()` / `fmt_span()`.
-- `--days N` (models/accounts/clients only): last N calendar days in the `--tz` zone,
-  window = [00:00 N-1 days ago, +infinity) via `started_at >= cutoff_ms` — the upper end
+- `--days N` (models/accounts/clients/sessions only): last N calendar days in the
+  `--tz` zone, window = [00:00 N-1 days ago, +infinity) via `started_at >= cutoff_ms` — the upper end
   is unbounded, i.e. "to now" as the READMEs phrase it (identical in practice unless the
   table somehow holds future records); `--days 0` counts as 1, negatives are a parse
   error; `TOTAL` covers the window; an empty window prints the window plus the newest

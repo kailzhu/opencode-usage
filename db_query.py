@@ -10,6 +10,8 @@
             与平均单次花费（总花费 ÷ 被计费的请求数）。
   clients   按调用 API 的客户端（由 user_agent 推导）列出花费、请求数、
             各类 token 消耗与平均单次花费（总花费 ÷ 被计费的请求数）。
+  sessions  按 session ID 列出花费、请求数、各类 token 消耗与平均单次花费
+            （总花费 ÷ 被计费的请求数），以及该 session 最新一条请求的时间、client / model。
 
 Example:
   uv run python db_query.py sources
@@ -17,10 +19,11 @@ Example:
   uv run python db_query.py models
   uv run python db_query.py accounts
   uv run python db_query.py clients
+  uv run python db_query.py sessions
   uv run python db_query.py accounts --db other.db
 
-sources / models / clients 默认只显示前 5 行（sources 取最近导入的 5 个文件，
-models、clients 取花费最高的 5 个），并用一行 ... 表示省略；--all 打印完整表格。
+sources / models / clients / sessions 默认只显示前 5 行（sources 取最近导入的 5 个文件，
+models、clients、sessions 取花费最高的 5 个），并用一行 ... 表示省略；--all 打印完整表格。
 TOTAL 行始终按全部记录汇总（加 --days 时按窗口内全量汇总）。
 """
 from __future__ import annotations
@@ -36,7 +39,7 @@ from shared.fmt import (client_name, fmt_count_pct, fmt_int, fmt_iso, fmt_ms,
 from shared.paths import DB_PATH
 from shared.table import render
 
-DEFAULT_ROWS = 5      # sources / models / clients 默认显示的行数；--all 显示全部
+DEFAULT_ROWS = 5      # sources / models / clients / sessions 默认显示的行数；--all 显示全部
 
 SOURCES_HEADERS = ["file name", "records", "added", "dup", "conflict", "trunc",
                    "data from", "data to", "span", "imported at"]
@@ -62,6 +65,13 @@ CLIENTS_HEADERS = ["client", "total cost (usd)", "requests", "input", "output",
 CLIENTS_ALIGNS = ["l"] + ["r"] * 8
 CLIENTS_GROUPS = [None, None, None,
                   "tokens", "tokens", "tokens", "tokens", "tokens", None]
+
+SESSIONS_HEADERS = ["session", "updated", "total cost (usd)", "requests", "input",
+                    "output", "reasoning", "cache read", "cache write", "cost/req",
+                    "client", "model"]
+SESSIONS_ALIGNS = ["l", "l"] + ["r"] * 8 + ["l", "l"]
+SESSIONS_GROUPS = [None, None, None, None,
+                   "tokens", "tokens", "tokens", "tokens", "tokens", None, None, None]
 
 
 def days_type(value: str) -> int:
@@ -447,6 +457,90 @@ def cmd_clients(conn: sqlite3.Connection, tz, show_all: bool = False,
     return 0
 
 
+def cmd_sessions(conn: sqlite3.Connection, tz, show_all: bool = False,
+                 cutoff_ms=None, window="") -> int:
+    where = " WHERE started_at >= ?" if cutoff_ms is not None else ""
+    params: tuple = (cutoff_ms,) if cutoff_ms is not None else ()
+    # Column layout is positional: r[1:8] is cost + requests + five token types,
+    # r[8] is the billed-request count used as the cost/req denominator.
+    rows = conn.execute(f"""
+        SELECT COALESCE(session_id, '(none)'),
+               SUM(COALESCE(cost_usd, 0)),
+               COUNT(*),
+               SUM(COALESCE(input_tokens, 0)),
+               SUM(COALESCE(output_tokens, 0)),
+               SUM(COALESCE(reasoning_tokens, 0)),
+               SUM(COALESCE(cache_read_tokens, 0)),
+               SUM(COALESCE(cache_write_tokens, 0)),
+               COALESCE(SUM(cost_usd IS NOT NULL), 0)   -- 被计费的请求数 = cost/req 的分母
+          FROM requests{where}
+         GROUP BY COALESCE(session_id, '(none)')
+         ORDER BY SUM(COALESCE(cost_usd, 0)) DESC, COUNT(*) DESC,
+                  COALESCE(session_id, '(none)')
+    """, params).fetchall()
+    if not rows:
+        print_no_rows(conn, tz, window)
+        return 0
+
+    # 每个 session 在统计窗口内最新的一条请求：client / model 取这一行。
+    latest_rows = conn.execute(f"""
+        SELECT COALESCE(session_id, '(none)'), app, user_agent, model, started_at
+          FROM (
+                SELECT session_id, app, user_agent, model, started_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY session_id
+                           ORDER BY started_at DESC, finished_at DESC, request_id DESC
+                       ) AS rn
+                  FROM requests{where}
+               )
+         WHERE rn = 1
+    """, params).fetchall()
+    latest = {session: (client_name(app, user_agent), model or "(none)", started_at)
+              for session, app, user_agent, model, started_at in latest_rows}
+
+    # cost, requests, input, output, reasoning, cache_read, cache_write, billed
+    tot = [0.0] + [0] * 7
+    for r in rows:
+        for i, v in enumerate(r[1:8]):
+            tot[i] += v
+        tot[7] += r[8]
+
+    picked = rows if show_all else rows[:DEFAULT_ROWS]
+    table = []
+    for session, cost, n, tok_in, tok_out, tok_reason, cache_r, cache_w, billed in picked:
+        client, model, updated_at = latest.get(session, ("(unknown)", "(none)", None))
+        table.append([
+            trunc_id(session), fmt_ms(updated_at, tz), f"{cost:.6f}", fmt_int(n),
+            fmt_int(tok_in), fmt_int(tok_out), fmt_int(tok_reason),
+            fmt_int(cache_r), fmt_int(cache_w),
+            f"{cost / billed:.6f}" if billed else "n/a",
+            client, model,
+        ])
+
+    if len(picked) < len(rows):                       # 省略了过长的部分
+        table.append(["..."] + [""] * (len(SESSIONS_HEADERS) - 1))
+    table.append([
+        "TOTAL", "", f"{tot[0]:.6f}", fmt_int(tot[1]),
+        fmt_int(tot[2]), fmt_int(tot[3]), fmt_int(tot[4]), fmt_int(tot[5]), fmt_int(tot[6]),
+        f"{tot[0] / tot[7]:.6f}" if tot[7] else "n/a",
+        "", "",
+    ])
+
+    print(title_with_window(f"{len(rows)} session(s)", window) + "\n")
+    render(SESSIONS_HEADERS, SESSIONS_ALIGNS, table,
+           separator_before=len(table) - 1, groups=SESSIONS_GROUPS)
+    print("\nlegend:\n"
+          "  session   = session_id（默认截断显示；空值显示 (none)）\n"
+          "  tokens    = 各类型 token 消耗量\n"
+          "  requests  = 请求总数（去重后）\n"
+          "  cost/req (usd) = 该行总花费 ÷ 被计费的请求数（= JSON 里带 cost 字段的记录数）；\n"
+          "              免费模型计 0 也算被计费（均值 0.000000）；没有可计费请求时显示 n/a\n"
+          "  updated   = 该 session 在统计窗口内最新一条请求的开始时间（按 --tz 显示，精确到分钟）\n"
+          "  client    = 该 session 在统计窗口内最新一条请求的客户端（口径同 clients）\n"
+          "  model     = 同一最新请求的 model；空值显示 (none)")
+    return 0
+
+
 def common_args(with_tz: bool = True) -> argparse.ArgumentParser:
     """子命令共享的选项：--db（所有子命令）与 --tz（显示时间与 --days 窗口划分的时区）。"""
     c = argparse.ArgumentParser(add_help=False)
@@ -571,6 +665,35 @@ def build_parser() -> argparse.ArgumentParser:
     cli_p.add_argument("--all", action="store_true",
                        help=f"打印完整表格（默认只显示总花费最高的 {DEFAULT_ROWS} 个客户端）")
     add_days_arg(cli_p)
+    ses_p = sub.add_parser(
+        "sessions",
+        parents=[common_args()],
+        help="按 session ID 列出花费、请求数、token 消耗与 cost/req",
+        description="按 session_id 汇总：总花费（USD）、请求总数、"
+                    "各类 token 消耗（input/output/reasoning/cache read/cache write）"
+                    "与平均单次花费（该行总花费 ÷ 被计费的请求数）；"
+                    "updated 列是该 session 在统计窗口内最新一条请求的开始时间，"
+                    "最后两列是同一请求使用的 client 与 model。"
+                    f"默认只列出总花费最高的 {DEFAULT_ROWS} 个 session，用 --all 查看全部。"
+                    "可用 --days N 只看最近 N 个自然日（按 --tz 时区划分）。",
+        epilog=(
+            "示例:\n"
+            "  uv run python db_query.py sessions\n"
+            "  uv run python db_query.py sessions --all\n"
+            "  uv run python db_query.py sessions --days 7\n"
+            "  uv run python db_query.py sessions --db other.db\n\n"
+            "排序：按总花费从高到低（相同再按请求数）；"
+            "TOTAL 按时间窗口内全量汇总（无 --days 时即全库）。\n"
+            "updated / client / model 取该 session 在窗口内最新一条请求（按 started_at，"
+            "并列时依次按 finished_at、request_id）的值；updated 精确到分钟。\n"
+            "cost/req = 该行总花费 ÷ **被计费**的请求数（JSON 里带 cost 字段的记录数），\n"
+            "免费模型计 0 也计入分母；无可计费请求时为 n/a。"
+        ) + DAYS_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ses_p.add_argument("--all", action="store_true",
+                       help=f"打印完整表格（默认只显示总花费最高的 {DEFAULT_ROWS} 个 session）")
+    add_days_arg(ses_p)
     return p
 
 
@@ -630,6 +753,18 @@ def run_clients(args) -> int:
         conn.close()
 
 
+def run_sessions(args) -> int:
+    conn = connect_ro(args)
+    if conn is None:
+        return 2
+    try:
+        tz = parse_tz(args.tz)
+        cutoff_ms, window = resolve_days(args, tz)
+        return cmd_sessions(conn, tz, show_all=args.all, cutoff_ms=cutoff_ms, window=window)
+    finally:
+        conn.close()
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -641,6 +776,8 @@ def main(argv=None) -> int:
         return run_accounts(args)
     if args.command == "clients":
         return run_clients(args)
+    if args.command == "sessions":
+        return run_sessions(args)
     parser.print_help()
     return 0
 

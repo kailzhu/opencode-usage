@@ -3,7 +3,7 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 Import multiple OpenCode usage JSON logs into a **single SQLite database**, deduplicate
-them by `request_id`, and analyse usage and cost per model, account or client.
+them by `request_id`, and analyse usage and cost per model, account, client or session.
 
 ## Directory layout
 
@@ -12,7 +12,7 @@ opencode-usage/
 ├─ logs/                       raw JSON logs (added manually, read-only; gitignored)
 ├─ schema.sql                  tables + indexes, executed by db_import.py
 ├─ db_import.py                importer: idempotent load, dedup, ledger, conflict log
-├─ db_query.py                 query tool: sources / models / accounts / clients subcommands
+├─ db_query.py                 query tool: sources / models / accounts / clients / sessions subcommands
 ├─ shared/                     shared modules: table rendering and formatters
 └─ usage.db                    SQLite database (generated; gitignored)
 ```
@@ -29,31 +29,32 @@ uv run python db_import.py --file logs/a.json logs/b.json
 # Parse and report only, without writing to the database
 uv run python db_import.py --dry-run
 
-# List commands (all take --all, --tz and --db; models/accounts/clients take --days)
+# List commands (all take --all, --tz and --db; models/accounts/clients/sessions take --days)
 uv run python db_query.py sources [--all] [--tz UTC] [--db other.db]
 uv run python db_query.py models [--all] [--days 7] [--tz UTC] [--db other.db]
 uv run python db_query.py accounts [--full-id] [--days 7] [--tz UTC] [--db other.db]
 uv run python db_query.py clients [--all] [--days 7] [--tz UTC] [--db other.db]
+uv run python db_query.py sessions [--all] [--days 7] [--tz UTC] [--db other.db]
 ```
 
 List commands show the top 5 rows by default — the most recently imported files
-(`sources`), the highest-total-cost models (`models`) and clients (`clients`), with
-ties broken by request count. A `...` row between the detail rows and `TOTAL` marks
-the omission; `--all` prints the full table. `TOTAL` always summarises the whole
-dataset, not just the rows shown. `accounts --full-id` prints only full IDs as an
+(`sources`), the highest-total-cost models (`models`), clients (`clients`) and sessions
+(`sessions`), with ties broken by request count. A `...` row between the detail rows and
+`TOTAL` marks the omission; `--all` prints the full table. `TOTAL` always summarises the
+whole dataset, not just the rows shown. `accounts --full-id` prints only full IDs as an
 indented tree, without a table.
 
 `sources` scans the files in data-time order and prints a gap note below the table
 when coverage is discontinuous (`A -> B: <span> missing (...)`).
 
-`models`, `accounts` and `clients` take `--days N` for the last N calendar days in the
+`models`, `accounts`, `clients` and `sessions` take `--days N` for the last N calendar days in the
 `--tz` zone (default: local; `--days 0` counts as 1): the window runs from 00:00 N-1 days
 ago to now, `TOTAL` covers the window, and the same command run in the morning vs
 evening can give different totals.
 
 ## Roadmap
 
-- [x] Import + query (`schema.sql`, `db_import.py`, `db_query.py` with `sources` / `models` / `accounts` / `clients`)
+- [x] Import + query (`schema.sql`, `db_import.py`, `db_query.py` with `sources` / `models` / `accounts` / `clients` / `sessions`)
 - [ ] **Aggregate report per model** → `db_analyze.py`, phase 1 outputs
       (1) a main table by `model` (with a `product` breakdown), (2) an overall summary; supports `--csv` and `--tz`
 - [ ] **Validation and anomaly report (deferred)**: retry distribution / per-attempt failure rate, anomaly list (e.g. `succeeded` without `cost`)
@@ -105,6 +106,13 @@ Full column definitions live in `schema.sql`.
   clients are whatever the logs contain (e.g. `openclaw`, `opencode-go-copilot`,
   `codex-desktop`). Falls back to `app`, then `(unknown)`; ordered by total cost then
   request count.
+- `sessions` groups by `session_id` (IDs are truncated in the table, empty values show
+  `(none)`), ordered by total cost then request count. Token columns are the same five
+  categories as `clients`; no combined total-token column is printed. `updated`, `client`
+  and `model` show the values from that session's latest request in the active `--days`
+  window (latest by `started_at`, then `finished_at`, then `request_id`). `updated` is the
+  request start time to the minute in the `--tz` zone; `client` is derived exactly as in
+  `clients`.
 
 `db_query.py` renders times according to `--tz` (default: the local timezone, shown as `UTC+xx` in the header); `--days` windows are drawn in the same zone.
 
